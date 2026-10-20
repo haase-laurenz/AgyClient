@@ -13,7 +13,7 @@
   "scripts": {
     "build": "npm run build:packages && npm run build --workspace=@agy-client/server && npm run build --workspace=@agy-client/web",
     "build:installer": "node scripts/build-installer.mjs",
-    "build:packages": "npm run build --workspace=@agy-client/agy-adapter && npm run build --workspace=@agy-client/permissions && npm run build --workspace=@agy-client/usage && npm run build --workspace=@agy-client/process-manager && npm run build --workspace=@agy-client/git-manager && npm run build --workspace=@agy-client/orchestrator",
+    "build:packages": "tsc -b packages/agy-adapter packages/permissions packages/usage packages/process-manager packages/git-manager packages/orchestrator",
     "dev:server": "npm run dev --workspace=@agy-client/server",
     "dev:web": "npm run dev --workspace=@agy-client/web",
     "start": "node apps/server/dist/cli.js start",

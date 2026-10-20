@@ -1,0 +1,12 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/agy-adapter" },
+    { "path": "./packages/permissions" },
+    { "path": "./packages/usage" },
+    { "path": "./packages/process-manager" },
+    { "path": "./packages/git-manager" },
+    { "path": "./packages/orchestrator" },
+    { "path": "./apps/server" }
+  ]
+}

@@ -6,19 +6,20 @@
 
 ## Command-Line Installation (Linux, macOS & Windows)
 
-### Option A: Linux & macOS Installer (`install.sh`)
-Clone the repository and run the installer script to build all packages and install `agyclient` (and `agy-client`) into `~/.local/bin`:
+### Option A: Linux & macOS Standalone Installer (`cliagent_installer.sh` — No Repo Clone Required)
+Run this single command on Linux or macOS (contains the pre-built Web UI, Backend, CLI & runtime dependencies — no `git clone`, `npm install`, or build step needed):
+
+```bash
+curl -fsSL https://github.com/haase-laurenz/AgyClient/raw/main/dist-installer/cliagent_installer.sh | bash
+```
+
+Or if you want to clone and build from source on Linux/macOS:
 
 ```bash
 git clone https://github.com/haase-laurenz/AgyClient.git
 cd AgyClient
 chmod +x scripts/install.sh scripts/start-agyclient.sh
 ./scripts/install.sh
-```
-
-Or install in one line on Linux/macOS:
-```bash
-curl -fsSL https://raw.githubusercontent.com/haase-laurenz/AgyClient/main/scripts/install.sh | bash
 ```
 
 Or link globally via `npm`:

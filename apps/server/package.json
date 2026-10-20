@@ -8,7 +8,7 @@
     "agy-client": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc",
     "start": "node ./dist/cli.js start"
   },
   "dependencies": {

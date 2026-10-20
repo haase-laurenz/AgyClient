@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -365,4 +366,112 @@ for (const outExe of exeTargets) {
   console.log(`  -> Built ${outExe} (${sizeKb} KB)`);
 }
 
-console.log('\nDone! Standalone Windows installers are ready in dist-installer/');
+// 5. Build Standalone Self-Extracting Linux / macOS Installer (cliagent_installer.sh)
+function collectFilesAsBundle(baseDir, currentDir = baseDir, map = {}) {
+  for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+    const full = path.join(currentDir, entry.name);
+    const rel = path.relative(baseDir, full).replace(/\\/g, '/');
+    if (entry.isDirectory()) {
+      collectFilesAsBundle(baseDir, full, map);
+    } else if (entry.isFile()) {
+      map[rel] = fs.readFileSync(full).toString('base64');
+    }
+  }
+  return map;
+}
+
+const bundleMap = collectFilesAsBundle(payloadDir);
+const compressedPayloadB64 = zlib
+  .gzipSync(Buffer.from(JSON.stringify(bundleMap), 'utf-8'), { level: 9 })
+  .toString('base64');
+
+const shInstallerContent = `#!/usr/bin/env bash
+# ==============================================================================
+# AgyClient v1.0.0 — Standalone Self-Extracting Linux & macOS Installer
+# Requires only Node.js >= 22.5.0 (no git, no npm install, no build step needed)
+# ==============================================================================
+set -euo pipefail
+
+INSTALL_ROOT="\${AGYCLIENT_INSTALL_DIR:-\$HOME/.local/share/agyclient}"
+APP_DIR="\$INSTALL_ROOT/app"
+BIN_DIR="\${AGYCLIENT_BIN_DIR:-\$HOME/.local/bin}"
+
+echo "========================================================"
+echo "  AgyClient v1.0.0 — Standalone Linux / macOS Installer"
+echo "========================================================"
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "[ERROR] Node.js (>= 22.5.0) is required. Please install Node.js first." >&2
+  exit 1
+fi
+
+NODE_VER="\$(node -v)"
+echo "[1/3] Detected Node.js \$NODE_VER"
+
+echo "[2/3] Extracting pre-built AgyClient bundle into \$APP_DIR..."
+mkdir -p "\$APP_DIR" "\$BIN_DIR"
+
+PAYLOAD_B64="${compressedPayloadB64}"
+
+AGY_TARGET_DIR="\$APP_DIR" AGY_PAYLOAD="\$PAYLOAD_B64" node -e '
+const fs = require("node:fs");
+const path = require("node:path");
+const zlib = require("node:zlib");
+const target = process.env.AGY_TARGET_DIR;
+const raw = zlib.gunzipSync(Buffer.from(process.env.AGY_PAYLOAD, "base64")).toString("utf-8");
+const files = JSON.parse(raw);
+for (const [rel, b64] of Object.entries(files)) {
+  const full = path.join(target, rel);
+  fs.mkdirSync(path.dirname(full), { recursive: true });
+  fs.writeFileSync(full, Buffer.from(b64, "base64"));
+}
+'
+
+chmod +x "\$APP_DIR/apps/server/dist/cli.js"
+
+echo "[3/3] Creating CLI executables in \$BIN_DIR..."
+cat > "\$BIN_DIR/agyclient" <<EOF
+#!/usr/bin/env bash
+exec node "\$APP_DIR/apps/server/dist/cli.js" "\\\$@"
+EOF
+chmod +x "\$BIN_DIR/agyclient"
+ln -sf "\$BIN_DIR/agyclient" "\$BIN_DIR/agy-client"
+
+# Add ~/.local/bin to shell profile if not already in PATH
+if [[ ":\$PATH:" != *":\$BIN_DIR:"* ]]; then
+  for rc in "\$HOME/.bashrc" "\$HOME/.zshrc" "\$HOME/.profile"; do
+    if [ -f "\$rc" ] && ! grep -q "\$BIN_DIR" "\$rc" 2>/dev/null; then
+      echo "" >> "\$rc"
+      echo "# Added by AgyClient Installer" >> "\$rc"
+      echo "export PATH=\\"\$BIN_DIR:\\\$PATH\\"" >> "\$rc"
+    fi
+  done
+fi
+
+echo ""
+echo "========================================================"
+echo "  Installation Complete!"
+echo "========================================================"
+echo "  Installed to : \$APP_DIR"
+echo "  CLI Binary   : \$BIN_DIR/agyclient"
+echo ""
+echo "  Run from any terminal:"
+echo "    agyclient start --open      # Launch Web Control Center"
+echo "    agyclient doctor            # Verify setup"
+echo "    agyclient status            # Show workspace status"
+echo "    agyclient run \\"<prompt>\\"    # Run an agent in terminal"
+echo "========================================================"
+`;
+
+const shTargets = [
+  path.join(outDir, 'cliagent_installer.sh'),
+  path.join(outDir, 'agyclient_installer.sh'),
+];
+
+for (const outSh of shTargets) {
+  fs.writeFileSync(outSh, shInstallerContent.replace(/\r\n/g, '\n'), 'utf-8');
+  const sizeKb = Math.round(fs.statSync(outSh).size / 1024);
+  console.log(`  -> Built ${outSh} (${sizeKb} KB)`);
+}
+
+console.log('\nDone! Standalone Windows (.exe) and Linux/macOS (.sh) installers are ready in dist-installer/');
