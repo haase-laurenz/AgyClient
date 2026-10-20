@@ -12,6 +12,7 @@
   ],
   "scripts": {
     "build": "npm run build:packages && npm run build --workspace=@agy-client/server && npm run build --workspace=@agy-client/web",
+    "build:installer": "node scripts/build-installer.mjs",
     "build:packages": "npm run build --workspace=@agy-client/agy-adapter && npm run build --workspace=@agy-client/permissions && npm run build --workspace=@agy-client/usage && npm run build --workspace=@agy-client/process-manager && npm run build --workspace=@agy-client/git-manager && npm run build --workspace=@agy-client/orchestrator",
     "dev:server": "npm run dev --workspace=@agy-client/server",
     "dev:web": "npm run dev --workspace=@agy-client/web",

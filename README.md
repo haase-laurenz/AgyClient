@@ -31,12 +31,19 @@ To uninstall the CLI links:
 ./scripts/install.sh --uninstall
 ```
 
-### Option B: Windows Installer (`install.ps1`)
-From PowerShell in the repository root:
+### Option B: Standalone Windows Installer (`cliagent_installer.exe` — No Repo Clone Required)
+Download and run **[`cliagent_installer.exe`](https://github.com/haase-laurenz/AgyClient/raw/main/dist-installer/cliagent_installer.exe)** (215 KB self-contained pre-built bundle, includes Web UI, Backend, CLI & runtime dependencies) or execute this one-liner in PowerShell:
+
+```powershell
+irm https://github.com/haase-laurenz/AgyClient/raw/main/dist-installer/cliagent_installer.exe -OutFile "$env:TEMP\cliagent_installer.exe"; & "$env:TEMP\cliagent_installer.exe" --silent
+```
+
+Or if you cloned the repository on Windows:
 
 ```powershell
 .\scripts\install.ps1
 ```
+*(To rebuild the `.exe` installer from source at any time, run `npm run build:installer`.)*
 
 ### Option C: Universal `npm` Global Link (Linux / macOS / Windows)
 Requires **Node.js >= 22.5.0** and **Git**:
