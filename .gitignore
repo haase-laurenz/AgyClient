@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+coverage/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env
+.env.local
+.agy-client/
+.worktrees/
+playwright-report/
+test-results/

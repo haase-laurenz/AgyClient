@@ -1,0 +1,19 @@
+{
+  "name": "@agy-client/server",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -b",
+    "start": "node ./dist/index.js"
+  },
+  "dependencies": {
+    "@agy-client/agy-adapter": "1.0.0",
+    "@agy-client/permissions": "1.0.0",
+    "@agy-client/usage": "1.0.0",
+    "@agy-client/process-manager": "1.0.0",
+    "@agy-client/git-manager": "1.0.0",
+    "@agy-client/orchestrator": "1.0.0",
+    "ws": "^8.18.0"
+  }
+}

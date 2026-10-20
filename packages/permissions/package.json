@@ -1,0 +1,13 @@
+{
+  "name": "@agy-client/permissions",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@agy-client/agy-adapter": "1.0.0"
+  }
+}
