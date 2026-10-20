@@ -37,10 +37,15 @@ export interface AgyStepUpdateEvent {
     conversation_id: string;
     step_index: number;
     state: 'ACTIVE' | 'DONE' | 'ERROR' | 'RUNNING' | string;
-    step_type: 'user_input' | 'agent_response' | 'tool_call' | 'thought' | string;
+    step_type: 'user_input' | 'agent_response' | 'tool_call' | 'tool' | 'thought' | string;
     text_delta?: string;
     tool_name?: string;
     tool_args?: Record<string, unknown>;
+    tool_info?: {
+      name?: string;
+      parameters?: Record<string, unknown>;
+      output?: string;
+    };
     duration_seconds?: number;
     usage?: AgyUsageMetrics;
   };
@@ -129,6 +134,70 @@ export interface AgyTranscriptStep {
 export function getDefaultAgyAppDataDir(): string {
   const home = process.env.USERPROFILE || process.env.HOME || os.homedir();
   return path.join(home, '.gemini', 'antigravity-cli');
+}
+
+/**
+ * Resolves the `agy` CLI executable path across Windows, macOS, and Linux,
+ * automatically checking common installation directories (`%LOCALAPPDATA%\agy\bin\agy.exe`,
+ * `~/.local/bin/agy`, `~/.agy/bin/agy`, `/usr/local/bin/agy`) if `agy` is not yet in `PATH`.
+ */
+export function resolveAgyBinary(customBin?: string): string {
+  const requested = customBin || process.env.AGY_BIN;
+  if (requested && requested !== 'agy') {
+    return requested;
+  }
+
+  // 1. Check if `agy` is directly resolvable in PATH
+  try {
+    const check = spawnSync('agy', ['--version'], {
+      encoding: 'utf-8',
+      timeout: 3000,
+      windowsHide: true,
+    });
+    if (!check.error && check.status === 0) {
+      return 'agy';
+    }
+  } catch {
+    // Fall through to well-known location discovery
+  }
+
+  // 2. Check well-known OS-specific installation paths
+  const home = process.env.USERPROFILE || process.env.HOME || os.homedir();
+  const candidates: string[] = [];
+
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+    const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+    candidates.push(
+      path.join(localAppData, 'agy', 'bin', 'agy.exe'),
+      path.join(localAppData, 'Programs', 'agy', 'bin', 'agy.exe'),
+      path.join(localAppData, 'Programs', 'Antigravity', 'bin', 'agy.exe'),
+      path.join(home, '.local', 'bin', 'agy.exe'),
+      path.join(home, '.agy', 'bin', 'agy.exe'),
+      path.join(appData, 'npm', 'agy.cmd')
+    );
+  } else {
+    candidates.push(
+      path.join(home, '.local', 'bin', 'agy'),
+      path.join(home, '.agy', 'bin', 'agy'),
+      path.join(home, '.gemini', 'antigravity-cli', 'bin', 'agy'),
+      '/usr/local/bin/agy',
+      '/opt/homebrew/bin/agy',
+      '/usr/bin/agy'
+    );
+  }
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return requested || 'agy';
 }
 
 /**
@@ -263,7 +332,7 @@ export class AgyCliAdapter {
 
   constructor(options?: { appDataDir?: string; agyBin?: string }) {
     this.appDataDir = options?.appDataDir ?? getDefaultAgyAppDataDir();
-    this.agyBin = options?.agyBin ?? 'agy';
+    this.agyBin = resolveAgyBinary(options?.agyBin);
   }
 
   public getAppDataDir(): string {

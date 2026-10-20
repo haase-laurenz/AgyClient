@@ -272,13 +272,34 @@ class AgyClientInstaller
         Directory.CreateDirectory(binDir);
         string cliJsPath = Path.Combine(appDir, "apps", "server", "dist", "cli.js");
 
-        string cmdContent = "@echo off\\r\\nnode \\"" + cliJsPath + "\\" %*\\r\\n";
+        string cmdContent =
+            "@echo off\\r\\n" +
+            "setlocal\\r\\n" +
+            "set \\"NODE_EXE=node\\"\\r\\n" +
+            "where node >nul 2>nul || set \\"NODE_EXE=%ProgramFiles%\\\\nodejs\\\\node.exe\\"\\r\\n" +
+            "\\"%NODE_EXE%\\" \\"" + cliJsPath + "\\" %*\\r\\n" +
+            "exit /b %ERRORLEVEL%\\r\\n";
         File.WriteAllText(Path.Combine(binDir, "agyclient.cmd"), cmdContent);
         File.WriteAllText(Path.Combine(binDir, "agy-client.cmd"), cmdContent);
 
-        string ps1Content = "& node \\"" + cliJsPath + "\\" @args\\r\\nexit $LASTEXITCODE\\r\\n";
-        File.WriteAllText(Path.Combine(binDir, "agyclient.ps1"), ps1Content);
-        File.WriteAllText(Path.Combine(binDir, "agy-client.ps1"), ps1Content);
+        // PowerShell .ps1 launchers are blocked by the default execution policy; remove stale ones
+        foreach (string stale in new string[] { "agyclient.ps1", "agy-client.ps1" })
+        {
+            try { File.Delete(Path.Combine(binDir, stale)); } catch { }
+        }
+
+        // Also install shims into WindowsApps, which is already on PATH in every session,
+        // so 'agyclient' works immediately without reopening the terminal.
+        try
+        {
+            string winApps = Path.Combine(localAppData, "Microsoft", "WindowsApps");
+            if (Directory.Exists(winApps))
+            {
+                File.WriteAllText(Path.Combine(winApps, "agyclient.cmd"), cmdContent);
+                File.WriteAllText(Path.Combine(winApps, "agy-client.cmd"), cmdContent);
+            }
+        }
+        catch { }
 
         // 4. Add %LOCALAPPDATA%\\AgyClient\\bin to Windows User PATH
         Console.ForegroundColor = ConsoleColor.Yellow;

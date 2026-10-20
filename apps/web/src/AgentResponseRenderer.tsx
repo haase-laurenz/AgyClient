@@ -23,6 +23,11 @@ export interface AgentLogEntry {
       text_delta?: string;
       tool_name?: string;
       tool_args?: Record<string, unknown>;
+      tool_info?: {
+        name?: string;
+        parameters?: Record<string, unknown>;
+        output?: string;
+      };
       duration_seconds?: number;
     };
     result?: {
@@ -42,8 +47,18 @@ export interface ToolExecutionItem {
   state: 'ACTIVE' | 'DONE' | 'ERROR' | string;
   stepIndex?: number;
   args?: Record<string, unknown>;
+  output?: string;
+  targetSummary?: string;
   durationSeconds?: number;
   timestamp: string;
+}
+
+export interface PrettyMarkdownBatch {
+  id: string;
+  index: number;
+  title?: string;
+  content: string;
+  isStreaming: boolean;
 }
 
 export type CoalescedConversationItem =
@@ -51,6 +66,7 @@ export type CoalescedConversationItem =
       kind: 'user_prompt';
       id: string;
       prompt: string;
+      fastResponse?: boolean;
       commandLine: string;
       timestamp: string;
     }
@@ -73,6 +89,8 @@ export type CoalescedConversationItem =
   | {
       kind: 'agent_response';
       id: string;
+      stepIndex?: number;
+      batchNumber?: number;
       markdown: string;
       isStreaming: boolean;
       durationSeconds?: number;
@@ -88,6 +106,56 @@ export type CoalescedConversationItem =
     };
 
 /**
+ * Strips `[FAST_RESPONSE_MODE]...[/FAST_RESPONSE_MODE]` directives from displayed prompts.
+ */
+export function stripFastResponseDirective(prompt: string): {
+  cleanPrompt: string;
+  fastResponse: boolean;
+} {
+  const hasDirective = /^\[FAST_RESPONSE_MODE\][\s\S]*?\[\/FAST_RESPONSE_MODE\]/i.test(
+    prompt.trim()
+  );
+  const cleanPrompt = prompt
+    .replace(/^\[FAST_RESPONSE_MODE\][\s\S]*?\[\/FAST_RESPONSE_MODE\]\s*/i, '')
+    .trim();
+  return { cleanPrompt: cleanPrompt || prompt.trim(), fastResponse: hasDirective };
+}
+
+/**
+ * Extracts a concise human-readable target summary from tool arguments (e.g. file basename or command summary).
+ */
+export function summarizeToolTarget(
+  toolName: string,
+  args?: Record<string, unknown>
+): string | undefined {
+  if (!args) return undefined;
+  const rawPath =
+    (typeof args.Path === 'string' && args.Path) ||
+    (typeof args.path === 'string' && args.path) ||
+    (typeof args.TargetFile === 'string' && args.TargetFile) ||
+    (typeof args.DirectoryPath === 'string' && args.DirectoryPath);
+  if (rawPath) {
+    const normalized = rawPath.replace(/\\/g, '/');
+    const parts = normalized.split('/').filter(Boolean);
+    return parts.slice(-2).join('/') || rawPath;
+  }
+  if (typeof args.toolSummary === 'string' && args.toolSummary.trim()) {
+    return args.toolSummary.trim();
+  }
+  if (typeof args.CommandLine === 'string' && args.CommandLine.trim()) {
+    const cmd = args.CommandLine.trim().replace(/\s+/g, ' ');
+    return cmd.length > 48 ? `${cmd.slice(0, 45)}...` : cmd;
+  }
+  if (typeof args.Role === 'string' && args.Role.trim()) {
+    return args.Role.trim();
+  }
+  if (typeof args.query === 'string' && args.query.trim()) {
+    return args.query.trim().slice(0, 45);
+  }
+  return undefined;
+}
+
+/**
  * Extracts the prompt string from a `Launching: agy ... --print "..."` system log line.
  */
 function extractPromptFromLaunchLog(text: string): string | null {
@@ -101,6 +169,7 @@ function extractPromptFromLaunchLog(text: string): string | null {
 /**
  * Coalesces raw streaming log chunks (`step_update` deltas, duplicate `result` events,
  * and `Tool [name] (ACTIVE/DONE)` pairs) into clean structured conversation items.
+ * Preserves intermediate Agent Response Batches in chronological order across tool groups.
  */
 export function coalesceSessionLogs(
   logs: AgentLogEntry[],
@@ -113,6 +182,7 @@ export function coalesceSessionLogs(
   const items: CoalescedConversationItem[] = [];
   const isSessionActive =
     options?.sessionStatus === 'running' || options?.sessionStatus === 'starting';
+  let currentTurnBatchCount = 0;
 
   for (const entry of logs) {
     const raw = entry.rawEvent;
@@ -120,12 +190,15 @@ export function coalesceSessionLogs(
     // 1. System logs: Launching command, Session initialized, Turn completed, etc.
     if (entry.stream === 'system') {
       if (entry.text.startsWith('Launching:')) {
-        const extractedPrompt =
+        currentTurnBatchCount = 0;
+        const rawExtracted =
           extractPromptFromLaunchLog(entry.text) || options?.fallbackPrompt || entry.text;
+        const { cleanPrompt, fastResponse } = stripFastResponseDirective(rawExtracted);
         items.push({
           kind: 'user_prompt',
           id: entry.id,
-          prompt: extractedPrompt,
+          prompt: cleanPrompt,
+          fastResponse: fastResponse || entry.text.includes('[FAST_RESPONSE_MODE]'),
           commandLine: entry.text,
           timestamp: entry.timestamp,
         });
@@ -198,12 +271,13 @@ export function coalesceSessionLogs(
     if (entry.stream === 'tool') {
       const su = raw?.step_update;
       const parsedMatch = /^Tool \[([^\]]+)\]\s*\(([^)]+)\)/.exec(entry.text);
-      const toolName = su?.tool_name || (parsedMatch ? parsedMatch[1] : 'tool');
+      const toolName = su?.tool_name || su?.tool_info?.name || (parsedMatch ? parsedMatch[1] : 'tool');
       const toolState = su?.state || (parsedMatch ? parsedMatch[2] : 'DONE');
       const stepIndex = su?.step_index;
+      const toolArgs = su?.tool_args || su?.tool_info?.parameters;
+      const toolOutput = su?.tool_info?.output;
 
       let group = items[items.length - 1];
-      // Look past trailing system_init or warning notices if a tool_group is right before them
       if (!group || group.kind !== 'tool_group') {
         group = {
           kind: 'tool_group',
@@ -222,10 +296,14 @@ export function coalesceSessionLogs(
       );
 
       if (existingIdx !== -1) {
+        const mergedArgs = toolArgs || group.tools[existingIdx].args;
         group.tools[existingIdx] = {
           ...group.tools[existingIdx],
           state: toolState,
-          args: su?.tool_args || group.tools[existingIdx].args,
+          args: mergedArgs,
+          output: toolOutput ?? group.tools[existingIdx].output,
+          targetSummary:
+            summarizeToolTarget(toolName, mergedArgs) ?? group.tools[existingIdx].targetSummary,
           durationSeconds: su?.duration_seconds ?? group.tools[existingIdx].durationSeconds,
         };
       } else {
@@ -234,7 +312,9 @@ export function coalesceSessionLogs(
           toolName,
           state: toolState,
           stepIndex,
-          args: su?.tool_args,
+          args: toolArgs,
+          output: toolOutput,
+          targetSummary: summarizeToolTarget(toolName, toolArgs),
           durationSeconds: su?.duration_seconds,
           timestamp: entry.timestamp,
         });
@@ -246,36 +326,64 @@ export function coalesceSessionLogs(
     if (entry.stream === 'agent' || entry.stream === 'stdout') {
       const isResultEvent = raw?.event === 'result';
       const stepState = raw?.step_update?.state;
+      const stepIndex = raw?.step_update?.step_index;
       const chunkText = isResultEvent
         ? raw?.result?.response || entry.text
         : raw?.step_update?.text_delta ?? entry.text;
 
-      // Find the current turn's active agent_response (after the last user_prompt)
-      let currentResponse: Extract<CoalescedConversationItem, { kind: 'agent_response' }> | null =
-        null;
+      // Collect all agent_response items in the current turn (after the last user_prompt)
+      const turnResponses: Array<Extract<CoalescedConversationItem, { kind: 'agent_response' }>> = [];
+      let hasToolGroupAfterLastResponse = false;
       for (let i = items.length - 1; i >= 0; i--) {
         const candidate = items[i];
         if (candidate.kind === 'user_prompt') break;
+        if (candidate.kind === 'tool_group' && turnResponses.length === 0) {
+          hasToolGroupAfterLastResponse = true;
+        }
         if (candidate.kind === 'agent_response') {
-          currentResponse = candidate;
-          break;
+          turnResponses.unshift(candidate);
         }
       }
 
+      const lastTurnResponse =
+        turnResponses.length > 0 ? turnResponses[turnResponses.length - 1] : null;
+
       if (isResultEvent) {
-        // The `result` event contains the complete, authoritative final response for the turn.
-        // Replace the delta-accumulated text instead of duplicating it!
-        if (currentResponse) {
-          if (chunkText && chunkText.trim().length >= currentResponse.markdown.trim().length * 0.5) {
-            currentResponse.markdown = chunkText;
+        // Mark all streaming responses in this turn as done
+        for (const resp of turnResponses) {
+          resp.isStreaming = false;
+        }
+
+        if (turnResponses.length === 1 && lastTurnResponse) {
+          if (chunkText && chunkText.trim().length >= lastTurnResponse.markdown.trim().length * 0.5) {
+            lastTurnResponse.markdown = chunkText;
           }
-          currentResponse.isStreaming = false;
-          currentResponse.durationSeconds =
-            raw?.result?.duration_seconds ?? currentResponse.durationSeconds;
+          lastTurnResponse.durationSeconds =
+            raw?.result?.duration_seconds ?? lastTurnResponse.durationSeconds;
+        } else if (turnResponses.length > 1 && lastTurnResponse) {
+          // Multiple batches were emitted across steps in this turn.
+          // Strip earlier batches from `result.response` so we don't duplicate them inside the final batch!
+          let remainingResult = chunkText.trim();
+          for (let b = 0; b < turnResponses.length - 1; b++) {
+            const earlier = turnResponses[b].markdown.trim();
+            if (earlier && remainingResult.startsWith(earlier)) {
+              remainingResult = remainingResult.slice(earlier.length).trim();
+            }
+          }
+          if (
+            remainingResult &&
+            remainingResult.length >= lastTurnResponse.markdown.trim().length * 0.5
+          ) {
+            lastTurnResponse.markdown = remainingResult;
+          }
+          lastTurnResponse.durationSeconds =
+            raw?.result?.duration_seconds ?? lastTurnResponse.durationSeconds;
         } else if (chunkText.trim()) {
+          currentTurnBatchCount++;
           items.push({
             kind: 'agent_response',
             id: entry.id,
+            batchNumber: currentTurnBatchCount,
             markdown: chunkText,
             isStreaming: false,
             durationSeconds: raw?.result?.duration_seconds,
@@ -285,31 +393,45 @@ export function coalesceSessionLogs(
         continue;
       }
 
-      // Heuristic deduplication for historical logs where `rawEvent` might not be populated
-      // and the final `result` entry repeats the entire accumulated response
-      if (
-        currentResponse &&
-        chunkText.length > 60 &&
-        currentResponse.markdown.length > 40 &&
-        chunkText.trim().slice(0, 40) === currentResponse.markdown.trim().slice(0, 40)
-      ) {
-        currentResponse.markdown = chunkText;
-        currentResponse.isStreaming = false;
-        continue;
-      }
+      // Determine whether this delta belongs to `lastTurnResponse` or starts a NEW chronological batch
+      const isNewBatch =
+        !lastTurnResponse ||
+        hasToolGroupAfterLastResponse ||
+        (stepIndex !== undefined &&
+          lastTurnResponse.stepIndex !== undefined &&
+          stepIndex !== lastTurnResponse.stepIndex);
 
-      if (currentResponse) {
-        currentResponse.markdown += chunkText;
+      if (!isNewBatch && lastTurnResponse) {
+        // Heuristic deduplication for historical logs where `rawEvent` might not be populated
+        // and the final `result` entry repeats the entire accumulated response
+        if (
+          chunkText.length > 60 &&
+          lastTurnResponse.markdown.length > 40 &&
+          chunkText.trim().slice(0, 40) === lastTurnResponse.markdown.trim().slice(0, 40)
+        ) {
+          lastTurnResponse.markdown = chunkText;
+          lastTurnResponse.isStreaming = false;
+          continue;
+        }
+
+        lastTurnResponse.markdown += chunkText;
         if (stepState === 'DONE') {
-          currentResponse.isStreaming = false;
+          lastTurnResponse.isStreaming = false;
           if (raw?.step_update?.duration_seconds) {
-            currentResponse.durationSeconds = raw.step_update.duration_seconds;
+            lastTurnResponse.durationSeconds = raw.step_update.duration_seconds;
           }
         }
       } else {
+        // Mark any previous batch in this turn as no longer actively streaming
+        if (lastTurnResponse) {
+          lastTurnResponse.isStreaming = false;
+        }
+        currentTurnBatchCount++;
         items.push({
           kind: 'agent_response',
           id: entry.id,
+          stepIndex,
+          batchNumber: currentTurnBatchCount,
           markdown: chunkText,
           isStreaming: isSessionActive && stepState !== 'DONE',
           durationSeconds: raw?.step_update?.duration_seconds,

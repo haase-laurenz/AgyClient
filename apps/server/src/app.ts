@@ -278,6 +278,7 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
           parentSessionId?: string | null;
           allowSubagents?: boolean;
           subagentRole?: string | null;
+          fastResponse?: boolean;
           prompt?: string;
           prompts?: string[];
           model?: string;
@@ -324,6 +325,7 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
                 title: sessionTitle,
                 prompt: promptText,
                 subagentRole: body.subagentRole || 'SubAgent',
+                fastResponse: body.fastResponse,
                 model: body.model,
                 effort: body.effort,
                 mode: body.mode as AgyExecutionMode | undefined,
@@ -341,9 +343,12 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
                 branchName,
                 allowSubagents: body.allowSubagents ?? true,
                 subagentRole: body.subagentRole ?? null,
+                fastResponse: Boolean(body.fastResponse),
                 prompt: promptText,
-                model: body.model || 'gemini-4-argon-medium',
-                effort: body.effort || 'medium',
+                model:
+                  body.model ||
+                  (body.fastResponse ? 'gemini-3.8-flash-low' : 'gemini-4-argon-medium'),
+                effort: body.effort || (body.fastResponse ? 'low' : 'medium'),
                 mode: (body.mode as AgyExecutionMode) || 'auto',
                 sandbox: Boolean(body.sandbox),
                 timeoutSeconds: body.timeoutSeconds,
@@ -399,6 +404,7 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
           const body = await readJsonBody<{
             title?: string;
             subagentRole?: string;
+            fastResponse?: boolean;
             prompt?: string;
             prompts?: string[];
             tasks?: Array<{ title?: string; role?: string; prompt: string; model?: string }>;
@@ -460,6 +466,7 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
             const sub = processManager.spawnSubagent(sessionId, {
               title: item.title,
               subagentRole: item.role || body.subagentRole || 'SubAgent',
+              fastResponse: body.fastResponse,
               prompt: item.prompt,
               model: item.model || body.model,
               effort: body.effort,
@@ -487,7 +494,13 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
         }
 
         if (subAction === 'prompt' && method === 'POST') {
-          const body = await readJsonBody<{ prompt?: string; timeoutSeconds?: number }>(req);
+          const body = await readJsonBody<{
+            prompt?: string;
+            timeoutSeconds?: number;
+            fastResponse?: boolean;
+            effort?: AgyReasoningEffort;
+            model?: string;
+          }>(req);
           if (!body.prompt || !body.prompt.trim()) {
             sendJson(res, 400, { error: 'Follow-up prompt cannot be empty.' });
             return;
@@ -495,7 +508,12 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
           const updated = processManager.sendFollowUpPrompt(
             sessionId,
             body.prompt.trim(),
-            body.timeoutSeconds
+            body.timeoutSeconds,
+            {
+              fastResponse: body.fastResponse,
+              effort: body.effort,
+              model: body.model,
+            }
           );
           sendJson(res, 200, { session: updated });
           return;

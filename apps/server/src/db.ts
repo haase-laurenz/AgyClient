@@ -66,6 +66,7 @@ export class AgyDatabase {
         execution_role TEXT NOT NULL,
         allow_subagents INTEGER NOT NULL DEFAULT 1,
         subagent_role TEXT,
+        fast_response INTEGER NOT NULL DEFAULT 0,
         model TEXT NOT NULL,
         effort TEXT NOT NULL,
         mode TEXT NOT NULL,
@@ -132,6 +133,11 @@ export class AgyDatabase {
     }
     try {
       this.db.exec(`ALTER TABLE agent_sessions ADD COLUMN subagent_role TEXT;`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agent_sessions ADD COLUMN fast_response INTEGER NOT NULL DEFAULT 0;`);
     } catch {
       // column already exists
     }
@@ -241,13 +247,13 @@ export class AgyDatabase {
       INSERT INTO agent_sessions (
         id, title, project_id, workspace_path, worktree_path, branch_name,
         conversation_id, parent_session_id, execution_role, allow_subagents, subagent_role,
-        model, effort, mode, sandbox, status, pid, prompt, last_response,
+        fast_response, model, effort, mode, sandbox, status, pid, prompt, last_response,
         input_tokens, output_tokens, thinking_tokens, cache_read_tokens, total_tokens,
         turn_count, duration_seconds, exit_code, error, created_at, updated_at
       ) VALUES (
         ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?, ?
       )
@@ -260,6 +266,9 @@ export class AgyDatabase {
         execution_role = excluded.execution_role,
         allow_subagents = excluded.allow_subagents,
         subagent_role = excluded.subagent_role,
+        fast_response = excluded.fast_response,
+        model = excluded.model,
+        effort = excluded.effort,
         status = excluded.status,
         pid = excluded.pid,
         prompt = excluded.prompt,
@@ -288,6 +297,7 @@ export class AgyDatabase {
       s.executionRole,
       s.allowSubagents === false ? 0 : 1,
       s.subagentRole ?? null,
+      s.fastResponse ? 1 : 0,
       s.model,
       s.effort,
       s.mode,
@@ -329,6 +339,7 @@ export class AgyDatabase {
           ? Boolean(Number(r.allow_subagents))
           : true,
       subagentRole: r.subagent_role ? String(r.subagent_role) : null,
+      fastResponse: Boolean(Number(r.fast_response ?? 0)),
       model: String(r.model),
       effort: (r.effort as ManagedAgentSession['effort']) || 'medium',
       mode: (r.mode as ManagedAgentSession['mode']) || 'auto',

@@ -8,6 +8,7 @@ import {
   AgyStreamEvent,
   AgyStreamParser,
   buildAgyCliArgs,
+  resolveAgyBinary,
 } from '@agy-client/agy-adapter';
 
 export type AgentSessionStatus =
@@ -39,6 +40,7 @@ export interface ManagedAgentSession {
   executionRole: 'independent' | 'subagent' | 'workflow-task';
   allowSubagents?: boolean;
   subagentRole?: string | null;
+  fastResponse?: boolean;
   model: string;
   effort: AgyReasoningEffort;
   mode: AgyExecutionMode;
@@ -72,6 +74,7 @@ export interface StartSessionRequest {
   executionRole?: 'independent' | 'subagent' | 'workflow-task';
   allowSubagents?: boolean;
   subagentRole?: string | null;
+  fastResponse?: boolean;
   prompt: string;
   model?: string;
   effort?: AgyReasoningEffort;
@@ -109,7 +112,7 @@ export class ProcessManager extends EventEmitter {
     initialSessions?: ManagedAgentSession[];
   }) {
     super();
-    this.agyBin = options?.agyBin ?? 'agy';
+    this.agyBin = resolveAgyBinary(options?.agyBin);
     this.hooks = options?.hooks ?? {};
     this.maxLogsPerSession = options?.maxLogsPerSession ?? 5000;
 
@@ -162,6 +165,82 @@ export class ProcessManager extends EventEmitter {
   }
 
   /**
+   * Formats a prompt with Fast Response & Pretty Batch Streaming instructions when `fastResponse` is enabled.
+   */
+  public static formatPromptWithFastResponse(prompt: string, fastResponse?: boolean): string {
+    const clean = ProcessManager.stripFastResponseDirective(prompt);
+    if (!fastResponse) {
+      return clean;
+    }
+    return [
+      '[FAST_RESPONSE_MODE]',
+      'Fast Response & Pretty Batch Mode:',
+      '1. Emit a concise initial Markdown batch immediately (before or alongside your first tool call) so the user receives instant feedback.',
+      '2. Stream your answer in self-contained Markdown batches (headings, bullet lists, paragraphs, and code blocks separated by blank lines) after each milestone.',
+      '3. Keep tool calls minimal and targeted for maximum speed.',
+      '[/FAST_RESPONSE_MODE]',
+      '',
+      clean,
+    ].join('\n');
+  }
+
+  /**
+   * Strips any `[FAST_RESPONSE_MODE]...[/FAST_RESPONSE_MODE]` wrapper from a prompt string.
+   */
+  public static stripFastResponseDirective(prompt: string): string {
+    return prompt
+      .replace(/^\[FAST_RESPONSE_MODE\][\s\S]*?\[\/FAST_RESPONSE_MODE\]\s*/i, '')
+      .trim();
+  }
+
+  /**
+   * Coalesces consecutive `step_update` `text_delta` events belonging to the same `step_index`
+   * within a single stdout buffer read into a single batch event to reduce SQLite/WebSocket overhead.
+   */
+  public static coalesceStreamEventsBatch(events: AgyStreamEvent[]): AgyStreamEvent[] {
+    if (events.length <= 1) return events;
+    const coalesced: AgyStreamEvent[] = [];
+
+    for (const ev of events) {
+      const prev = coalesced[coalesced.length - 1];
+      if (
+        prev &&
+        prev.event === 'step_update' &&
+        'step_update' in prev &&
+        ev.event === 'step_update' &&
+        'step_update' in ev
+      ) {
+        const prevSu = prev.step_update;
+        const currSu = ev.step_update;
+        if (
+          prevSu.step_type === 'agent_response' &&
+          currSu.step_type === 'agent_response' &&
+          prevSu.step_index === currSu.step_index &&
+          !prevSu.tool_name &&
+          !currSu.tool_name &&
+          typeof prevSu.text_delta === 'string' &&
+          typeof currSu.text_delta === 'string' &&
+          prevSu.state === 'ACTIVE'
+        ) {
+          coalesced[coalesced.length - 1] = {
+            ...ev,
+            step_update: {
+              ...currSu,
+              text_delta: prevSu.text_delta + currSu.text_delta,
+              usage: currSu.usage ?? prevSu.usage,
+              duration_seconds: currSu.duration_seconds ?? prevSu.duration_seconds,
+            },
+          };
+          continue;
+        }
+      }
+      coalesced.push(ev);
+    }
+
+    return coalesced;
+  }
+
+  /**
    * Extracts structured `<subagent title="..." role="...">prompt</subagent>` directives from agent responses.
    */
   public static extractSubagentDirectives(text: string): SubagentDirective[] {
@@ -204,9 +283,13 @@ export class ProcessManager extends EventEmitter {
       throw new Error(`Workspace directory does not exist: ${effectiveCwd}`);
     }
 
+    const cleanPrompt = ProcessManager.stripFastResponseDirective(req.prompt);
+    const fastResponse = Boolean(req.fastResponse);
+    const effectiveEffort: AgyReasoningEffort = req.effort || (fastResponse ? 'low' : 'medium');
+
     const session: ManagedAgentSession = {
       id,
-      title: req.title?.trim() || req.prompt.trim().slice(0, 65) || `Agent ${id.slice(0, 8)}`,
+      title: req.title?.trim() || cleanPrompt.slice(0, 65) || `Agent ${id.slice(0, 8)}`,
       projectId: req.projectId ?? null,
       workspacePath: req.workspacePath,
       worktreePath: req.worktreePath ?? null,
@@ -216,13 +299,14 @@ export class ProcessManager extends EventEmitter {
       executionRole: req.executionRole ?? (req.parentSessionId ? 'subagent' : 'independent'),
       allowSubagents: req.allowSubagents ?? true,
       subagentRole: req.subagentRole ?? null,
-      model: req.model || 'gemini-4-argon-medium',
-      effort: req.effort || 'medium',
+      fastResponse,
+      model: req.model || (fastResponse ? 'gemini-3.8-flash-low' : 'gemini-4-argon-medium'),
+      effort: effectiveEffort,
       mode: req.mode || 'auto',
       sandbox: Boolean(req.sandbox),
       status: 'starting',
       pid: null,
-      prompt: req.prompt,
+      prompt: cleanPrompt,
       lastResponse: '',
       inputTokens: 0,
       outputTokens: 0,
@@ -241,7 +325,7 @@ export class ProcessManager extends EventEmitter {
     this.logs.set(id, []);
     this.persistAndEmit(session);
 
-    this.spawnAgyTurn(session, req.prompt, req.timeoutSeconds);
+    this.spawnAgyTurn(session, cleanPrompt, req.timeoutSeconds);
     return session;
   }
 
@@ -254,6 +338,7 @@ export class ProcessManager extends EventEmitter {
       title?: string;
       prompt: string;
       subagentRole?: string | null;
+      fastResponse?: boolean;
       model?: string;
       effort?: AgyReasoningEffort;
       mode?: AgyExecutionMode;
@@ -275,6 +360,7 @@ export class ProcessManager extends EventEmitter {
     const roleLabel = req.subagentRole?.trim() || 'SubAgent';
     const childTitle =
       req.title?.trim() || `[${roleLabel}] ${req.prompt.trim().slice(0, 52)}`;
+    const fastResponse = req.fastResponse ?? parent.fastResponse ?? false;
 
     const child = this.startSession({
       title: childTitle,
@@ -286,9 +372,10 @@ export class ProcessManager extends EventEmitter {
       executionRole: 'subagent',
       allowSubagents: req.allowSubagents ?? false,
       subagentRole: roleLabel,
+      fastResponse,
       prompt: req.prompt,
       model: req.model || parent.model,
-      effort: req.effort || parent.effort,
+      effort: req.effort || (fastResponse ? 'low' : parent.effort),
       mode: req.mode || parent.mode,
       sandbox: req.sandbox ?? parent.sandbox,
       timeoutSeconds: req.timeoutSeconds,
@@ -312,7 +399,12 @@ export class ProcessManager extends EventEmitter {
   public sendFollowUpPrompt(
     sessionId: string,
     prompt: string,
-    timeoutSeconds?: number
+    timeoutSeconds?: number,
+    options?: {
+      fastResponse?: boolean;
+      effort?: AgyReasoningEffort;
+      model?: string;
+    }
   ): ManagedAgentSession {
     const session = this.sessions.get(sessionId);
     if (!session) {
@@ -322,13 +414,26 @@ export class ProcessManager extends EventEmitter {
       throw new Error(`Session "${sessionId}" is currently running a turn.`);
     }
 
-    session.prompt = prompt;
+    const cleanPrompt = ProcessManager.stripFastResponseDirective(prompt);
+    session.prompt = cleanPrompt;
+    if (options?.fastResponse !== undefined) {
+      session.fastResponse = options.fastResponse;
+      if (options.fastResponse && !options.effort) {
+        session.effort = 'low';
+      }
+    }
+    if (options?.effort) {
+      session.effort = options.effort;
+    }
+    if (options?.model) {
+      session.model = options.model;
+    }
     session.status = 'starting';
     session.error = null;
     session.updatedAt = new Date().toISOString();
     this.persistAndEmit(session);
 
-    this.spawnAgyTurn(session, prompt, timeoutSeconds);
+    this.spawnAgyTurn(session, cleanPrompt, timeoutSeconds);
     return session;
   }
 
@@ -338,8 +443,9 @@ export class ProcessManager extends EventEmitter {
     timeoutSeconds?: number
   ): void {
     const effectiveCwd = session.worktreePath || session.workspacePath;
+    const cliPrompt = ProcessManager.formatPromptWithFastResponse(prompt, session.fastResponse);
     const args = buildAgyCliArgs({
-      prompt,
+      prompt: cliPrompt,
       model: session.model,
       effort: session.effort,
       mode: session.mode,
@@ -392,8 +498,8 @@ export class ProcessManager extends EventEmitter {
     let accumulatedDeltaText = '';
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      const events = parser.feed(chunk);
-      if (events.length === 0) {
+      const rawEvents = parser.feed(chunk);
+      if (rawEvents.length === 0) {
         const plain = chunk.toString('utf-8').trim();
         if (plain) {
           this.appendLog(session.id, 'stdout', plain);
@@ -401,9 +507,13 @@ export class ProcessManager extends EventEmitter {
         return;
       }
 
+      const events = ProcessManager.coalesceStreamEventsBatch(rawEvents);
       for (const ev of events) {
         this.handleStreamEvent(session, ev, (delta) => {
           accumulatedDeltaText += delta;
+          if (accumulatedDeltaText.trim()) {
+            session.lastResponse = accumulatedDeltaText.trim();
+          }
         });
       }
     });
@@ -415,13 +525,17 @@ export class ProcessManager extends EventEmitter {
       }
     });
 
-    child.on('error', (err) => {
+    child.on('error', (err: NodeJS.ErrnoException) => {
       this.processes.delete(session.id);
       session.pid = null;
       session.status = 'failed';
-      session.error = err.message;
+      if (err.code === 'ENOENT') {
+        session.error = `Antigravity CLI ('${this.agyBin}') was not found on this machine (ENOENT). Please install the Google Antigravity CLI ('agy') and ensure it is in your PATH (or set AGY_BIN).`;
+      } else {
+        session.error = err.message;
+      }
       session.updatedAt = new Date().toISOString();
-      this.appendLog(session.id, 'stderr', `Process error: ${err.message}`);
+      this.appendLog(session.id, 'stderr', `Process error: ${session.error}`);
       this.persistAndEmit(session);
       this.emit('session:failed', session);
     });
@@ -564,6 +678,9 @@ export class ProcessManager extends EventEmitter {
         }
       }
       if (su.tool_name) {
+        if (!su.tool_args && su.tool_info?.parameters) {
+          su.tool_args = su.tool_info.parameters;
+        }
         this.appendLog(
           session.id,
           'tool',
@@ -578,7 +695,7 @@ export class ProcessManager extends EventEmitter {
         ) {
           const mapKey = `${session.id}:step:${su.step_index ?? 0}`;
           const existingChildId = this.nativeSubagentMap.get(mapKey);
-          const args = su.tool_args || {};
+          const args = su.tool_args || su.tool_info?.parameters || {};
           const role = String(args.Role || args.TypeName || 'SubAgent');
           const subPrompt = String(args.Prompt || 'Delegated complex subtask');
           const subModel =
@@ -601,6 +718,7 @@ export class ProcessManager extends EventEmitter {
               executionRole: 'subagent',
               allowSubagents: false,
               subagentRole: role,
+              fastResponse: session.fastResponse,
               model: subModel,
               effort: session.effort,
               mode: session.mode,

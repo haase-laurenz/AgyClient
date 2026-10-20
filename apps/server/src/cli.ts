@@ -9,6 +9,7 @@ import {
   AgyExecutionMode,
   AgyReasoningEffort,
   getDefaultAgyAppDataDir,
+  resolveAgyBinary,
 } from '@agy-client/agy-adapter';
 import {
   PERMISSION_PRESETS,
@@ -85,6 +86,8 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       } else if (short === 'e' && next && !next.startsWith('-')) {
         flags.effort = next;
         i++;
+      } else if (short === 'f') {
+        flags.fast = true;
       } else if (short === 'h') {
         flags.help = true;
       } else if (short === 'v') {
@@ -136,8 +139,9 @@ Global & Server Options:
   --open                       Automatically open the Web UI in your default browser
 
 Agent Run Options (agyclient run "<prompt>"):
-  -m, --model <id>             Model ID (default: gemini-4-argon-medium)
-  -e, --effort <level>         Reasoning effort: low | medium | high | xhigh | max (default: medium)
+  -f, --fast                   Enable Fast Response Mode (low-latency model/effort + progressive batch streaming)
+  -m, --model <id>             Model ID (default: gemini-4-argon-medium, or gemini-3.8-flash-low with --fast)
+  -e, --effort <level>         Reasoning effort: low | medium | high | xhigh | max (default: medium, or low with --fast)
   --mode <mode>                Execution mode: auto | accept-edits | plan (default: auto)
   --worktree                   Run the agent inside an isolated Git worktree (.worktrees/<slug>)
   --sandbox                    Run agy with --sandbox enabled
@@ -184,10 +188,11 @@ export async function runCli(argv: string[], env: CliEnvironment = {}): Promise<
       ? parsed.flags.workspace
       : env.cwd || process.cwd()
   );
-  const agyBin =
+  const agyBin = resolveAgyBinary(
     typeof parsed.flags['agy-bin'] === 'string'
       ? parsed.flags['agy-bin']
-      : env.agyBin || process.env.AGY_BIN || 'agy';
+      : env.agyBin || process.env.AGY_BIN
+  );
   const appDataDir = env.appDataDir || getDefaultAgyAppDataDir();
   const settingsPath = env.settingsPath || path.join(appDataDir, 'settings.json');
   const backupDir = env.backupDir || path.join(appDataDir, 'backups-agyclient');
@@ -641,8 +646,20 @@ export async function runCli(argv: string[], env: CliEnvironment = {}): Promise<
       }
     }
 
-    const model = typeof parsed.flags.model === 'string' ? parsed.flags.model : 'gemini-4-argon-medium';
-    const effort = (typeof parsed.flags.effort === 'string' ? parsed.flags.effort : 'medium') as AgyReasoningEffort;
+    const fastResponse = Boolean(parsed.flags.fast);
+    const model =
+      typeof parsed.flags.model === 'string'
+        ? parsed.flags.model
+        : fastResponse
+        ? 'gemini-3.8-flash-low'
+        : 'gemini-4-argon-medium';
+    const effort = (
+      typeof parsed.flags.effort === 'string'
+        ? parsed.flags.effort
+        : fastResponse
+        ? 'low'
+        : 'medium'
+    ) as AgyReasoningEffort;
     const mode = (typeof parsed.flags.mode === 'string' ? parsed.flags.mode : 'auto') as AgyExecutionMode;
     const timeoutSeconds =
       typeof parsed.flags.timeout === 'string' ? Number(parsed.flags.timeout) : undefined;
@@ -674,6 +691,7 @@ export async function runCli(argv: string[], env: CliEnvironment = {}): Promise<
         workspacePath,
         worktreePath,
         branchName,
+        fastResponse,
         prompt,
         model,
         effort,
