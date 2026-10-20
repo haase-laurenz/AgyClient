@@ -5,13 +5,5 @@
     "rootDir": "./src",
     "types": ["node", "ws"]
   },
-  "include": ["src/**/*"],
-  "references": [
-    { "path": "../../packages/agy-adapter" },
-    { "path": "../../packages/permissions" },
-    { "path": "../../packages/usage" },
-    { "path": "../../packages/process-manager" },
-    { "path": "../../packages/git-manager" },
-    { "path": "../../packages/orchestrator" }
-  ]
+  "include": ["src/**/*"]
 }
