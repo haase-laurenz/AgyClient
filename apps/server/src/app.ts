@@ -145,7 +145,7 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
   });
 
   for (const s of initialSessions) {
-    processManager.hydrateSessionLogs(s.id, db.loadSessionLogs(s.id, 300));
+    processManager.hydrateSessionLogs(s.id, db.loadSessionLogs(s.id, 2500));
   }
 
   const gitManager = new GitWorktreeManager();
@@ -275,6 +275,9 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
           title?: string;
           projectId?: string | null;
           workspacePath?: string;
+          parentSessionId?: string | null;
+          allowSubagents?: boolean;
+          subagentRole?: string | null;
           prompt?: string;
           prompts?: string[];
           model?: string;
@@ -316,19 +319,35 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
               ? `${body.title} (#${i + 1})`
               : body.title || promptText.slice(0, 65);
 
-          const session = processManager.startSession({
-            title: sessionTitle,
-            projectId: body.projectId ?? null,
-            workspacePath,
-            worktreePath,
-            branchName,
-            prompt: promptText,
-            model: body.model || 'gemini-4-argon-medium',
-            effort: body.effort || 'medium',
-            mode: (body.mode as AgyExecutionMode) || 'auto',
-            sandbox: Boolean(body.sandbox),
-            timeoutSeconds: body.timeoutSeconds,
-          });
+          const session = body.parentSessionId
+            ? processManager.spawnSubagent(body.parentSessionId, {
+                title: sessionTitle,
+                prompt: promptText,
+                subagentRole: body.subagentRole || 'SubAgent',
+                model: body.model,
+                effort: body.effort,
+                mode: body.mode as AgyExecutionMode | undefined,
+                sandbox: body.sandbox,
+                worktreePath: worktreePath ?? undefined,
+                branchName: branchName ?? undefined,
+                allowSubagents: body.allowSubagents ?? false,
+                timeoutSeconds: body.timeoutSeconds,
+              })
+            : processManager.startSession({
+                title: sessionTitle,
+                projectId: body.projectId ?? null,
+                workspacePath,
+                worktreePath,
+                branchName,
+                allowSubagents: body.allowSubagents ?? true,
+                subagentRole: body.subagentRole ?? null,
+                prompt: promptText,
+                model: body.model || 'gemini-4-argon-medium',
+                effort: body.effort || 'medium',
+                mode: (body.mode as AgyExecutionMode) || 'auto',
+                sandbox: Boolean(body.sandbox),
+                timeoutSeconds: body.timeoutSeconds,
+              });
           launched.push(session);
         }
 
@@ -339,7 +358,7 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
         return;
       }
 
-      const sessionMatch = /^\/api\/sessions\/([^/]+)(?:\/(logs|prompt|stop))?$/.exec(pathname);
+      const sessionMatch = /^\/api\/sessions\/([^/]+)(?:\/(logs|prompt|stop|subagents))?$/.exec(pathname);
       if (sessionMatch) {
         const sessionId = decodeURIComponent(sessionMatch[1]);
         const subAction = sessionMatch[2];
@@ -354,6 +373,7 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
                 session: null,
                 logs: [],
                 transcript,
+                subagents: [],
               });
               return;
             }
@@ -361,10 +381,102 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
             return;
           }
           const logs = processManager.getSessionLogs(sessionId);
+          const subagents = processManager.getSubagents(sessionId);
           const transcript = session.conversationId
             ? adapter.readConversationTranscript(session.conversationId)
             : [];
-          sendJson(res, 200, { session, logs, transcript });
+          sendJson(res, 200, { session, logs, transcript, subagents });
+          return;
+        }
+
+        if (subAction === 'subagents' && method === 'GET') {
+          const subagents = processManager.getSubagents(sessionId);
+          sendJson(res, 200, { subagents });
+          return;
+        }
+
+        if (subAction === 'subagents' && method === 'POST') {
+          const body = await readJsonBody<{
+            title?: string;
+            subagentRole?: string;
+            prompt?: string;
+            prompts?: string[];
+            tasks?: Array<{ title?: string; role?: string; prompt: string; model?: string }>;
+            model?: string;
+            effort?: AgyReasoningEffort;
+            mode?: AgyExecutionMode;
+            sandbox?: boolean;
+            useWorktree?: boolean;
+            allowSubagents?: boolean;
+            timeoutSeconds?: number;
+          }>(req);
+
+          const parent = processManager.getSession(sessionId);
+          if (!parent) {
+            sendJson(res, 404, { error: `Parent session "${sessionId}" not found.` });
+            return;
+          }
+
+          const taskItems: Array<{ title?: string; role?: string; prompt: string; model?: string }> =
+            Array.isArray(body.tasks) && body.tasks.length > 0
+              ? body.tasks.filter((t) => t && t.prompt && t.prompt.trim())
+              : Array.isArray(body.prompts) && body.prompts.length > 0
+              ? body.prompts
+                  .filter((p) => p && p.trim())
+                  .map((p, idx) => ({
+                    title:
+                      body.prompts!.length > 1 && body.title
+                        ? `${body.title} (#${idx + 1})`
+                        : body.title,
+                    role: body.subagentRole,
+                    prompt: p.trim(),
+                  }))
+              : body.prompt?.trim()
+              ? [{ title: body.title, role: body.subagentRole, prompt: body.prompt.trim() }]
+              : [];
+
+          if (taskItems.length === 0) {
+            sendJson(res, 400, { error: 'At least one SubAgent prompt is required.' });
+            return;
+          }
+
+          const spawned = [];
+          for (let i = 0; i < taskItems.length; i++) {
+            const item = taskItems[i];
+            let worktreePath: string | null | undefined = undefined;
+            let branchName: string | null | undefined = undefined;
+
+            if (body.useWorktree) {
+              const slug = `sub-${(item.title || item.role || 'task').slice(0, 16)}-${Date.now().toString(36)}-${i + 1}`;
+              try {
+                const wt = gitManager.createWorktree(parent.workspacePath, slug);
+                worktreePath = wt.worktreePath;
+                branchName = wt.branch;
+              } catch {
+                // fallback to parent workspace
+              }
+            }
+
+            const sub = processManager.spawnSubagent(sessionId, {
+              title: item.title,
+              subagentRole: item.role || body.subagentRole || 'SubAgent',
+              prompt: item.prompt,
+              model: item.model || body.model,
+              effort: body.effort,
+              mode: body.mode,
+              sandbox: body.sandbox,
+              worktreePath,
+              branchName,
+              allowSubagents: body.allowSubagents ?? false,
+              timeoutSeconds: body.timeoutSeconds,
+            });
+            spawned.push(sub);
+          }
+
+          sendJson(res, 201, {
+            subagent: spawned[0],
+            subagents: spawned,
+          });
           return;
         }
 
@@ -480,7 +592,7 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
       if (pathname === '/api/permissions/delete-lock' && method === 'GET') {
         const dir = parsedUrl.searchParams.get('path') || defaultWorkspace;
         const status = permissions.checkDirectoryDeleteProtection(dir);
-        const commands = PermissionsManager.getWindowsDeleteLockCommands(dir);
+        const commands = PermissionsManager.getDeleteLockCommands(dir);
         sendJson(res, 200, { path: dir, ...status, commands });
         return;
       }
@@ -493,7 +605,7 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
         }>(req);
         if (!body.confirmSecurityChange) {
           sendJson(res, 400, {
-            error: 'confirmSecurityChange: true is required to change NTFS delete ACLs.',
+            error: 'confirmSecurityChange: true is required to change OS-level delete protection.',
           });
           return;
         }
@@ -501,9 +613,9 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
         const enable = Boolean(body.enable);
         const result = permissions.setDirectoryDeleteProtection(targetDir, enable);
         const audit = db.addAuditLog({
-          action: enable ? 'ntfs.delete_lock.enable' : 'ntfs.delete_lock.disable',
+          action: enable ? 'os.delete_lock.enable' : 'os.delete_lock.disable',
           riskLevel: 'critical',
-          details: `${enable ? 'Enabled' : 'Disabled'} Windows NTFS (DE,DC) delete protection on ${targetDir} (${result.command})`,
+          details: `${enable ? 'Enabled' : 'Disabled'} OS-level delete protection on ${targetDir} (${result.command})`,
         });
         broadcast({ type: 'audit:logged', audit });
         sendJson(res, 200, { ...result, audit });
@@ -701,6 +813,7 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
           const ext = path.extname(candidatePath).toLowerCase();
           res.writeHead(200, {
             'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
+            'Cache-Control': ext === '.html' ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600',
             'X-Content-Type-Options': 'nosniff',
           });
           fs.createReadStream(candidatePath).pipe(res);
@@ -712,6 +825,7 @@ export function createAgyServer(options: AgyServerOptions = {}): AgyServerInstan
         if (fs.existsSync(indexHtml)) {
           res.writeHead(200, {
             'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
             'X-Content-Type-Options': 'nosniff',
           });
           fs.createReadStream(indexHtml).pipe(res);

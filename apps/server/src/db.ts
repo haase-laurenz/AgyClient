@@ -30,6 +30,7 @@ export interface SecurityAuditEntry {
 
 export class AgyDatabase {
   private readonly db: DatabaseSyncType;
+  private closed = false;
 
   constructor(dbPath: string) {
     if (dbPath !== ':memory:') {
@@ -63,6 +64,8 @@ export class AgyDatabase {
         conversation_id TEXT,
         parent_session_id TEXT,
         execution_role TEXT NOT NULL,
+        allow_subagents INTEGER NOT NULL DEFAULT 1,
+        subagent_role TEXT,
         model TEXT NOT NULL,
         effort TEXT NOT NULL,
         mode TEXT NOT NULL,
@@ -120,6 +123,18 @@ export class AgyDatabase {
         max_requests INTEGER NOT NULL
       );
     `);
+
+    // Migrate existing databases to ensure allow_subagents and subagent_role columns exist
+    try {
+      this.db.exec(`ALTER TABLE agent_sessions ADD COLUMN allow_subagents INTEGER NOT NULL DEFAULT 1;`);
+    } catch {
+      // column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agent_sessions ADD COLUMN subagent_role TEXT;`);
+    } catch {
+      // column already exists
+    }
 
     // Seed default model budgets if empty
     const budgetCount = this.db
@@ -221,17 +236,18 @@ export class AgyDatabase {
   }
 
   public saveSession(s: ManagedAgentSession): void {
+    if (this.closed) return;
     const stmt = this.db.prepare(`
       INSERT INTO agent_sessions (
         id, title, project_id, workspace_path, worktree_path, branch_name,
-        conversation_id, parent_session_id, execution_role, model, effort, mode,
-        sandbox, status, pid, prompt, last_response,
+        conversation_id, parent_session_id, execution_role, allow_subagents, subagent_role,
+        model, effort, mode, sandbox, status, pid, prompt, last_response,
         input_tokens, output_tokens, thinking_tokens, cache_read_tokens, total_tokens,
         turn_count, duration_seconds, exit_code, error, created_at, updated_at
       ) VALUES (
         ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?, ?
       )
@@ -240,6 +256,10 @@ export class AgyDatabase {
         worktree_path = excluded.worktree_path,
         branch_name = excluded.branch_name,
         conversation_id = excluded.conversation_id,
+        parent_session_id = excluded.parent_session_id,
+        execution_role = excluded.execution_role,
+        allow_subagents = excluded.allow_subagents,
+        subagent_role = excluded.subagent_role,
         status = excluded.status,
         pid = excluded.pid,
         prompt = excluded.prompt,
@@ -266,6 +286,8 @@ export class AgyDatabase {
       s.conversationId,
       s.parentSessionId,
       s.executionRole,
+      s.allowSubagents === false ? 0 : 1,
+      s.subagentRole ?? null,
       s.model,
       s.effort,
       s.mode,
@@ -302,6 +324,11 @@ export class AgyDatabase {
       conversationId: r.conversation_id ? String(r.conversation_id) : null,
       parentSessionId: r.parent_session_id ? String(r.parent_session_id) : null,
       executionRole: (r.execution_role as ManagedAgentSession['executionRole']) || 'independent',
+      allowSubagents:
+        r.allow_subagents !== undefined && r.allow_subagents !== null
+          ? Boolean(Number(r.allow_subagents))
+          : true,
+      subagentRole: r.subagent_role ? String(r.subagent_role) : null,
       model: String(r.model),
       effort: (r.effort as ManagedAgentSession['effort']) || 'medium',
       mode: (r.mode as ManagedAgentSession['mode']) || 'auto',
@@ -325,6 +352,7 @@ export class AgyDatabase {
   }
 
   public appendLog(entry: AgentLogEntry): void {
+    if (this.closed) return;
     this.db
       .prepare(
         'INSERT INTO agent_logs (id, session_id, timestamp, stream, text, raw_event_json) VALUES (?, ?, ?, ?, ?, ?)'
@@ -339,7 +367,7 @@ export class AgyDatabase {
       );
   }
 
-  public loadSessionLogs(sessionId: string, limit = 500): AgentLogEntry[] {
+  public loadSessionLogs(sessionId: string, limit = 2500): AgentLogEntry[] {
     const rows = this.db
       .prepare(
         'SELECT * FROM agent_logs WHERE session_id = ? ORDER BY timestamp ASC LIMIT ?'
@@ -359,6 +387,7 @@ export class AgyDatabase {
   }
 
   public saveWorkflow(wf: WorkflowRun): void {
+    if (this.closed) return;
     this.db
       .prepare(
         `INSERT INTO workflows (id, name, status, payload_json, created_at, updated_at)
@@ -439,6 +468,8 @@ export class AgyDatabase {
   }
 
   public close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.db.close();
   }
 }

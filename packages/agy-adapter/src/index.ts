@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 
@@ -511,10 +512,17 @@ export class AgyCliAdapter {
   public static fileUriToPath(uri: string): string {
     if (!uri.startsWith('file://')) return uri;
     try {
-      const decoded = decodeURIComponent(uri.replace(/^file:\/\/\/?/, ''));
-      return decoded.replace(/\//g, path.sep);
+      return fileURLToPath(uri);
     } catch {
-      return uri;
+      try {
+        const stripped = decodeURIComponent(uri.replace(/^file:\/\//, ''));
+        if (/^\/[a-zA-Z]:/.test(stripped)) {
+          return stripped.slice(1).replace(/\//g, path.sep);
+        }
+        return stripped.replace(/\//g, path.sep);
+      } catch {
+        return uri;
+      }
     }
   }
 }

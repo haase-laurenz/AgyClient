@@ -10,5 +10,6 @@ coverage/
 .env.local
 .agy-client/
 .worktrees/
+*.tsbuildinfo
 playwright-report/
 test-results/

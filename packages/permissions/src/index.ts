@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { getDefaultAgyAppDataDir } from '@agy-client/agy-adapter';
 
@@ -93,7 +94,7 @@ const BUILTIN_DESTRUCTIVE_PATTERNS: Array<{
   },
   {
     id: 'disk-system-destructive',
-    regex: /\b(Format-Volume|format\.com|diskpart|cipher\s+\/w|reg\s+delete|sc\s+delete)\b/i,
+    regex: /\b(Format-Volume|format\.com|diskpart|cipher\s+\/w|reg\s+delete|sc\s+delete|mkfs(?:\.[a-z0-9]+)?|wipefs|shred\b|dd\s+if=)\b/i,
     riskLevel: 'critical',
     reason: 'System or volume destructive command blocked.',
     action: 'deny',
@@ -456,26 +457,82 @@ export class PermissionsManager {
   }
 
   /**
-   * Windows NTFS OS-Level Delete Protection (`icacls`)
-   * Denies `DE` (Delete) and `DC` (Delete Child) permissions on a target folder for the current user
-   * while keeping Read, Write, Create, and Execute permissions intact.
+   * Cross-platform OS-Level Delete Protection commands:
+   * - Windows (`win32`): NTFS `icacls` `(OI)(CI)(DE,DC)` deny ACL
+   * - macOS (`darwin`): APFS/HFS+ `chmod +a` `deny delete,delete_child` ACL
+   * - Linux (`linux`): ext4/xfs/btrfs `chattr +a` append-only directory attribute
+   */
+  public static getDeleteLockCommands(
+    targetDir: string,
+    username?: string,
+    platform: NodeJS.Platform = process.platform
+  ): {
+    platform: NodeJS.Platform;
+    mechanism: string;
+    enableCommand: string;
+    disableCommand: string;
+    checkCommand: string;
+  } {
+    const user =
+      username ||
+      process.env.USERNAME ||
+      process.env.USER ||
+      (() => {
+        try {
+          return os.userInfo().username;
+        } catch {
+          return 'Users';
+        }
+      })();
+    const normalizedDir = path.resolve(targetDir);
+
+    if (platform === 'win32') {
+      return {
+        platform,
+        mechanism: 'Windows NTFS icacls (DE,DC)',
+        enableCommand: `icacls "${normalizedDir}" /deny "${user}:(OI)(CI)(DE,DC)"`,
+        disableCommand: `icacls "${normalizedDir}" /remove:d "${user}"`,
+        checkCommand: `icacls "${normalizedDir}"`,
+      };
+    }
+
+    if (platform === 'darwin') {
+      return {
+        platform,
+        mechanism: 'macOS NFSv4 ACL (deny delete,delete_child)',
+        enableCommand: `chmod -R +a "user:${user} deny delete,delete_child" "${normalizedDir}"`,
+        disableCommand: `chmod -R -a "user:${user} deny delete,delete_child" "${normalizedDir}"`,
+        checkCommand: `ls -lde "${normalizedDir}"`,
+      };
+    }
+
+    return {
+      platform,
+      mechanism: 'Linux filesystem append-only attribute (chattr +a)',
+      enableCommand: `chattr +a "${normalizedDir}"`,
+      disableCommand: `chattr -a "${normalizedDir}"`,
+      checkCommand: `lsattr -d "${normalizedDir}"`,
+    };
+  }
+
+  /**
+   * Windows NTFS OS-Level Delete Protection (`icacls`) — kept for backward compatibility.
    */
   public static getWindowsDeleteLockCommands(targetDir: string, username?: string): {
     enableCommand: string;
     disableCommand: string;
     checkCommand: string;
   } {
-    const user = username || process.env.USERNAME || 'Users';
-    const normalizedDir = path.resolve(targetDir);
+    const cmds = PermissionsManager.getDeleteLockCommands(targetDir, username, 'win32');
     return {
-      enableCommand: `icacls "${normalizedDir}" /deny "${user}:(OI)(CI)(DE,DC)"`,
-      disableCommand: `icacls "${normalizedDir}" /remove:d "${user}"`,
-      checkCommand: `icacls "${normalizedDir}"`,
+      enableCommand: cmds.enableCommand,
+      disableCommand: cmds.disableCommand,
+      checkCommand: cmds.checkCommand,
     };
   }
 
   /**
-   * Applies or removes Windows NTFS OS-level delete restriction (`(DE,DC)`) on a workspace directory.
+   * Applies or removes OS-level delete restriction on a workspace directory across Windows, macOS, and Linux.
    */
   public setDirectoryDeleteProtection(targetDir: string, enable: boolean): {
     success: boolean;
@@ -486,30 +543,73 @@ export class PermissionsManager {
     if (!fs.existsSync(resolved)) {
       throw new Error(`Target directory does not exist: ${resolved}`);
     }
-    const user = process.env.USERNAME;
-    if (!user) {
-      throw new Error('Could not determine current Windows USERNAME.');
+    const user =
+      process.env.USERNAME ||
+      process.env.USER ||
+      (() => {
+        try {
+          return os.userInfo().username;
+        } catch {
+          return '';
+        }
+      })();
+
+    if (process.platform === 'win32') {
+      if (!user) {
+        throw new Error('Could not determine current Windows USERNAME.');
+      }
+      const args = enable
+        ? [resolved, '/deny', `${user}:(OI)(CI)(DE,DC)`]
+        : [resolved, '/remove:d', user];
+
+      const res = spawnSync('icacls', args, {
+        encoding: 'utf-8',
+        windowsHide: true,
+        timeout: 10000,
+      });
+
+      return {
+        success: res.status === 0,
+        output: (res.stdout || res.stderr || '').trim(),
+        command: `icacls ${args.map((a) => `"${a}"`).join(' ')}`,
+      };
     }
 
-    const args = enable
-      ? [resolved, '/deny', `${user}:(OI)(CI)(DE,DC)`]
-      : [resolved, '/remove:d', user];
+    if (process.platform === 'darwin') {
+      const rule = `user:${user || 'everyone'} deny delete,delete_child`;
+      const args = ['-R', enable ? '+a' : '-a', rule, resolved];
+      const res = spawnSync('chmod', args, {
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+      return {
+        success: res.status === 0,
+        output: (res.stdout || res.stderr || '').trim(),
+        command: `chmod ${args.map((a) => `"${a}"`).join(' ')}`,
+      };
+    }
 
-    const res = spawnSync('icacls', args, {
+    // Linux: chattr +a / -a
+    const flag = enable ? '+a' : '-a';
+    const args = [flag, resolved];
+    const res = spawnSync('chattr', args, {
       encoding: 'utf-8',
-      windowsHide: true,
       timeout: 10000,
     });
-
+    const out = (res.stdout || res.stderr || '').trim();
     return {
       success: res.status === 0,
-      output: (res.stdout || res.stderr || '').trim(),
-      command: `icacls ${args.map((a) => `"${a}"`).join(' ')}`,
+      output:
+        out ||
+        (res.status !== 0
+          ? `chattr ${flag} requires root/CAP_LINUX_IMMUTABLE on Linux (run: sudo chattr ${flag} "${resolved}")`
+          : `Applied chattr ${flag} on ${resolved}`),
+      command: `chattr ${flag} "${resolved}"`,
     };
   }
 
   /**
-   * Checks whether Windows NTFS `(DE,DC)` deny ACL is currently active on a directory.
+   * Checks whether OS-level delete protection is currently active on a directory.
    */
   public checkDirectoryDeleteProtection(targetDir: string): {
     protected: boolean;
@@ -519,13 +619,42 @@ export class PermissionsManager {
     if (!fs.existsSync(resolved)) {
       return { protected: false, rawAcl: '' };
     }
-    const res = spawnSync('icacls', [resolved], {
+
+    if (process.platform === 'win32') {
+      const res = spawnSync('icacls', [resolved], {
+        encoding: 'utf-8',
+        windowsHide: true,
+        timeout: 5000,
+      });
+      const out = (res.stdout || '').trim();
+      const isProtected = /\(DENY\)/i.test(out) || /\(N\)/i.test(out);
+      return {
+        protected: isProtected,
+        rawAcl: out,
+      };
+    }
+
+    if (process.platform === 'darwin') {
+      const res = spawnSync('ls', ['-lde', resolved], {
+        encoding: 'utf-8',
+        timeout: 5000,
+      });
+      const out = (res.stdout || '').trim();
+      const isProtected = /deny\s+.*delete/i.test(out);
+      return {
+        protected: isProtected,
+        rawAcl: out,
+      };
+    }
+
+    // Linux: lsattr -d <dir>
+    const res = spawnSync('lsattr', ['-d', resolved], {
       encoding: 'utf-8',
-      windowsHide: true,
       timeout: 5000,
     });
     const out = (res.stdout || '').trim();
-    const isProtected = /\(DENY\)/i.test(out) || /\(N\)/i.test(out);
+    const attrPart = out.split(/\s+/)[0] || '';
+    const isProtected = attrPart.includes('a') || attrPart.includes('i');
     return {
       protected: isProtected,
       rawAcl: out,

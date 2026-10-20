@@ -3,9 +3,13 @@
   "version": "1.0.0",
   "type": "module",
   "main": "./dist/index.js",
+  "bin": {
+    "agyclient": "./dist/cli.js",
+    "agy-client": "./dist/cli.js"
+  },
   "scripts": {
     "build": "tsc -b",
-    "start": "node ./dist/index.js"
+    "start": "node ./dist/cli.js start"
   },
   "dependencies": {
     "@agy-client/agy-adapter": "1.0.0",

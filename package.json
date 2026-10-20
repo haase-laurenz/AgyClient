@@ -1,8 +1,11 @@
 {
   "name": "agy-client",
   "version": "1.0.0",
-  "private": true,
-  "description": "AgyClient - Local Control Center for Google Antigravity CLI (agy)",
+  "description": "AgyClient - Cross-Platform Control Center & CLI for Google Antigravity (agy)",
+  "bin": {
+    "agyclient": "./apps/server/dist/cli.js",
+    "agy-client": "./apps/server/dist/cli.js"
+  },
   "workspaces": [
     "packages/*",
     "apps/*"
@@ -12,7 +15,8 @@
     "build:packages": "npm run build --workspace=@agy-client/agy-adapter && npm run build --workspace=@agy-client/permissions && npm run build --workspace=@agy-client/usage && npm run build --workspace=@agy-client/process-manager && npm run build --workspace=@agy-client/git-manager && npm run build --workspace=@agy-client/orchestrator",
     "dev:server": "npm run dev --workspace=@agy-client/server",
     "dev:web": "npm run dev --workspace=@agy-client/web",
-    "start": "node apps/server/dist/index.js",
+    "start": "node apps/server/dist/cli.js start",
+    "cli": "node apps/server/dist/cli.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -b"

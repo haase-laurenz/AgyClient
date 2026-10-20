@@ -37,6 +37,8 @@ export interface ManagedAgentSession {
   conversationId: string | null;
   parentSessionId: string | null;
   executionRole: 'independent' | 'subagent' | 'workflow-task';
+  allowSubagents?: boolean;
+  subagentRole?: string | null;
   model: string;
   effort: AgyReasoningEffort;
   mode: AgyExecutionMode;
@@ -68,12 +70,21 @@ export interface StartSessionRequest {
   conversationId?: string | null;
   parentSessionId?: string | null;
   executionRole?: 'independent' | 'subagent' | 'workflow-task';
+  allowSubagents?: boolean;
+  subagentRole?: string | null;
   prompt: string;
   model?: string;
   effort?: AgyReasoningEffort;
   mode?: AgyExecutionMode;
   sandbox?: boolean;
   timeoutSeconds?: number;
+}
+
+export interface SubagentDirective {
+  title: string;
+  role: string;
+  prompt: string;
+  model?: string;
 }
 
 export interface ProcessManagerPersistenceHooks {
@@ -86,6 +97,8 @@ export class ProcessManager extends EventEmitter {
   private readonly sessions = new Map<string, ManagedAgentSession>();
   private readonly processes = new Map<string, ChildProcess>();
   private readonly logs = new Map<string, AgentLogEntry[]>();
+  private readonly nativeSubagentMap = new Map<string, string>();
+  private readonly spawnedDirectives = new Set<string>();
   private readonly hooks: ProcessManagerPersistenceHooks;
   private readonly maxLogsPerSession: number;
 
@@ -98,7 +111,7 @@ export class ProcessManager extends EventEmitter {
     super();
     this.agyBin = options?.agyBin ?? 'agy';
     this.hooks = options?.hooks ?? {};
-    this.maxLogsPerSession = options?.maxLogsPerSession ?? 1000;
+    this.maxLogsPerSession = options?.maxLogsPerSession ?? 5000;
 
     if (options?.initialSessions) {
       for (const s of options.initialSessions) {
@@ -129,12 +142,54 @@ export class ProcessManager extends EventEmitter {
     return this.sessions.get(sessionId);
   }
 
+  public getSubagents(parentSessionId: string): ManagedAgentSession[] {
+    const parent = this.sessions.get(parentSessionId);
+    return Array.from(this.sessions.values())
+      .filter(
+        (s) =>
+          s.parentSessionId === parentSessionId ||
+          (parent?.conversationId && s.parentSessionId === parent.conversationId)
+      )
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
   public getSessionLogs(sessionId: string): AgentLogEntry[] {
     return this.logs.get(sessionId) ?? [];
   }
 
   public hydrateSessionLogs(sessionId: string, entries: AgentLogEntry[]): void {
     this.logs.set(sessionId, entries.slice(-this.maxLogsPerSession));
+  }
+
+  /**
+   * Extracts structured `<subagent title="..." role="...">prompt</subagent>` directives from agent responses.
+   */
+  public static extractSubagentDirectives(text: string): SubagentDirective[] {
+    const directives: SubagentDirective[] = [];
+    const tagRegex = /<subagent\b([^>]*)>([\s\S]*?)<\/subagent>/gi;
+    let match: RegExpExecArray | null;
+    while ((match = tagRegex.exec(text)) !== null) {
+      const attrs = match[1] || '';
+      const prompt = (match[2] || '').trim();
+      if (!prompt) continue;
+
+      const titleMatch = /title\s*=\s*"([^"]+)"/i.exec(attrs);
+      const roleMatch = /role\s*=\s*"([^"]+)"/i.exec(attrs);
+      const modelMatch = /model\s*=\s*"([^"]+)"/i.exec(attrs);
+
+      const role = roleMatch ? roleMatch[1].trim() : 'SubAgent';
+      const title = titleMatch
+        ? titleMatch[1].trim()
+        : `[${role}] ${prompt.slice(0, 50)}`;
+
+      directives.push({
+        title,
+        role,
+        prompt,
+        model: modelMatch ? modelMatch[1].trim() : undefined,
+      });
+    }
+    return directives;
   }
 
   /**
@@ -158,7 +213,9 @@ export class ProcessManager extends EventEmitter {
       branchName: req.branchName ?? null,
       conversationId: req.conversationId ?? null,
       parentSessionId: req.parentSessionId ?? null,
-      executionRole: req.executionRole ?? 'independent',
+      executionRole: req.executionRole ?? (req.parentSessionId ? 'subagent' : 'independent'),
+      allowSubagents: req.allowSubagents ?? true,
+      subagentRole: req.subagentRole ?? null,
       model: req.model || 'gemini-4-argon-medium',
       effort: req.effort || 'medium',
       mode: req.mode || 'auto',
@@ -186,6 +243,67 @@ export class ProcessManager extends EventEmitter {
 
     this.spawnAgyTurn(session, req.prompt, req.timeoutSeconds);
     return session;
+  }
+
+  /**
+   * Spawns a child SubAgent session linked to a parent Agent session for more complex tasks.
+   */
+  public spawnSubagent(
+    parentSessionId: string,
+    req: {
+      title?: string;
+      prompt: string;
+      subagentRole?: string | null;
+      model?: string;
+      effort?: AgyReasoningEffort;
+      mode?: AgyExecutionMode;
+      sandbox?: boolean;
+      worktreePath?: string | null;
+      branchName?: string | null;
+      allowSubagents?: boolean;
+      timeoutSeconds?: number;
+    }
+  ): ManagedAgentSession {
+    const parent = this.sessions.get(parentSessionId);
+    if (!parent) {
+      throw new Error(`Parent session "${parentSessionId}" not found.`);
+    }
+    if (parent.allowSubagents === false) {
+      throw new Error(`Parent session "${parent.title}" has SubAgent spawning disabled.`);
+    }
+
+    const roleLabel = req.subagentRole?.trim() || 'SubAgent';
+    const childTitle =
+      req.title?.trim() || `[${roleLabel}] ${req.prompt.trim().slice(0, 52)}`;
+
+    const child = this.startSession({
+      title: childTitle,
+      projectId: parent.projectId,
+      workspacePath: parent.workspacePath,
+      worktreePath: req.worktreePath !== undefined ? req.worktreePath : parent.worktreePath,
+      branchName: req.branchName !== undefined ? req.branchName : parent.branchName,
+      parentSessionId: parent.id,
+      executionRole: 'subagent',
+      allowSubagents: req.allowSubagents ?? false,
+      subagentRole: roleLabel,
+      prompt: req.prompt,
+      model: req.model || parent.model,
+      effort: req.effort || parent.effort,
+      mode: req.mode || parent.mode,
+      sandbox: req.sandbox ?? parent.sandbox,
+      timeoutSeconds: req.timeoutSeconds,
+    });
+
+    this.appendLog(
+      parent.id,
+      'system',
+      `Spawned SubAgent [${roleLabel}]: "${child.title}" (session=${child.id.slice(0, 8)})`
+    );
+    parent.updatedAt = new Date().toISOString();
+    this.persistAndEmit(parent);
+    this.emit('subagent:spawned', { parent, subagent: child });
+
+    return child;
   }
 
   /**
@@ -342,12 +460,71 @@ export class ProcessManager extends EventEmitter {
           `Turn completed in ${session.durationSeconds.toFixed(1)}s (${session.totalTokens.toLocaleString()} total tokens).`
         );
         this.persistAndEmit(session);
+
+        // Complete any native invoke_subagent sessions attached to this parent turn
+        for (const child of this.getSubagents(session.id)) {
+          if (!this.processes.has(child.id) && (child.status === 'running' || child.status === 'starting')) {
+            child.status = 'completed';
+            child.updatedAt = new Date().toISOString();
+            this.appendLog(child.id, 'system', 'Native SubAgent completed.');
+            this.persistAndEmit(child);
+          }
+        }
+
+        // Automatically spawn SubAgents if the agent emitted <subagent ...> directives
+        if (session.allowSubagents !== false && session.lastResponse) {
+          const directives = ProcessManager.extractSubagentDirectives(session.lastResponse);
+          for (const dir of directives) {
+            const dirKey = `${session.id}:${dir.role}:${dir.title}:${dir.prompt}`;
+            if (!this.spawnedDirectives.has(dirKey)) {
+              this.spawnedDirectives.add(dirKey);
+              try {
+                this.spawnSubagent(session.id, {
+                  title: dir.title,
+                  subagentRole: dir.role,
+                  prompt: dir.prompt,
+                  model: dir.model,
+                });
+              } catch {
+                // ignore if subagent spawn fails
+              }
+            }
+          }
+        }
+
+        if (session.parentSessionId) {
+          const parent = this.sessions.get(session.parentSessionId);
+          if (parent) {
+            this.appendLog(
+              parent.id,
+              'system',
+              `SubAgent "${session.title}" completed in ${session.durationSeconds.toFixed(1)}s (${session.totalTokens.toLocaleString()} tokens).`
+            );
+            parent.updatedAt = new Date().toISOString();
+            this.persistAndEmit(parent);
+          }
+        }
+
         this.emit('session:completed', session);
       } else {
         session.status = 'failed';
         session.error = session.error || `agy exited with code ${code}`;
         this.appendLog(session.id, 'stderr', `Agent failed with exit code ${code}.`);
         this.persistAndEmit(session);
+
+        if (session.parentSessionId) {
+          const parent = this.sessions.get(session.parentSessionId);
+          if (parent) {
+            this.appendLog(
+              parent.id,
+              'stderr',
+              `SubAgent "${session.title}" failed: ${session.error}`
+            );
+            parent.updatedAt = new Date().toISOString();
+            this.persistAndEmit(parent);
+          }
+        }
+
         this.emit('session:failed', session);
       }
     });
@@ -382,7 +559,7 @@ export class ProcessManager extends EventEmitter {
       }
       if (su.text_delta) {
         onDelta(su.text_delta);
-        if (su.text_delta.trim()) {
+        if (su.text_delta.length > 0) {
           this.appendLog(session.id, 'agent', su.text_delta, ev);
         }
       }
@@ -393,6 +570,93 @@ export class ProcessManager extends EventEmitter {
           `Tool [${su.tool_name}] (${su.state})`,
           ev
         );
+
+        // Track native invoke_subagent tool calls as hierarchical child SubAgent sessions
+        if (
+          session.allowSubagents !== false &&
+          (su.tool_name === 'invoke_subagent' || su.tool_name === 'default_api:invoke_subagent')
+        ) {
+          const mapKey = `${session.id}:step:${su.step_index ?? 0}`;
+          const existingChildId = this.nativeSubagentMap.get(mapKey);
+          const args = su.tool_args || {};
+          const role = String(args.Role || args.TypeName || 'SubAgent');
+          const subPrompt = String(args.Prompt || 'Delegated complex subtask');
+          const subModel =
+            typeof args.Model === 'string' && args.Model !== 'inherit'
+              ? args.Model
+              : session.model;
+
+          if (!existingChildId) {
+            const now = new Date().toISOString();
+            const childId = crypto.randomUUID();
+            const childSession: ManagedAgentSession = {
+              id: childId,
+              title: `[${role}] ${subPrompt.slice(0, 52)}`,
+              projectId: session.projectId,
+              workspacePath: session.workspacePath,
+              worktreePath: session.worktreePath,
+              branchName: session.branchName,
+              conversationId: null,
+              parentSessionId: session.id,
+              executionRole: 'subagent',
+              allowSubagents: false,
+              subagentRole: role,
+              model: subModel,
+              effort: session.effort,
+              mode: session.mode,
+              sandbox: session.sandbox,
+              status: su.state === 'DONE' ? 'completed' : 'running',
+              pid: session.pid,
+              prompt: subPrompt,
+              lastResponse:
+                su.state === 'DONE'
+                  ? `Completed native SubAgent task (${role}).`
+                  : '',
+              inputTokens: 0,
+              outputTokens: 0,
+              thinkingTokens: 0,
+              cacheReadTokens: 0,
+              totalTokens: 0,
+              turnCount: 1,
+              durationSeconds: su.duration_seconds ?? 0,
+              exitCode: su.state === 'DONE' ? 0 : null,
+              error: null,
+              createdAt: now,
+              updatedAt: now,
+            };
+            this.nativeSubagentMap.set(mapKey, childId);
+            this.sessions.set(childId, childSession);
+            this.logs.set(childId, []);
+            this.appendLog(
+              childId,
+              'system',
+              `Native SubAgent invoked by "${session.title}" (Role: ${role})`
+            );
+            this.persistAndEmit(childSession);
+          } else {
+            const childSession = this.sessions.get(existingChildId);
+            if (childSession) {
+              if (su.state === 'DONE') {
+                childSession.status = 'completed';
+                childSession.exitCode = 0;
+                childSession.durationSeconds = su.duration_seconds ?? childSession.durationSeconds;
+                if (!childSession.lastResponse) {
+                  childSession.lastResponse = `Completed native SubAgent task (${role}).`;
+                }
+                this.appendLog(
+                  childSession.id,
+                  'system',
+                  `SubAgent finished in ${(childSession.durationSeconds || 0).toFixed(1)}s.`
+                );
+              } else if (su.state === 'ERROR') {
+                childSession.status = 'failed';
+                childSession.error = 'SubAgent tool invocation failed';
+              }
+              childSession.updatedAt = new Date().toISOString();
+              this.persistAndEmit(childSession);
+            }
+          }
+        }
       }
       if (su.usage) {
         this.applyUsageUpdate(session, su.usage);
@@ -458,7 +722,7 @@ export class ProcessManager extends EventEmitter {
   }
 
   /**
-   * Stops a running `agy` process and terminates its entire Windows process tree (`taskkill /T /F`).
+   * Stops a running `agy` process and terminates its process tree across Windows (`taskkill /T /F`) and Linux/macOS (`pkill -P` + `SIGTERM`).
    */
   public stopSession(sessionId: string): ManagedAgentSession {
     const session = this.sessions.get(sessionId);
@@ -478,6 +742,13 @@ export class ProcessManager extends EventEmitter {
             timeout: 5000,
           });
         } else {
+          try {
+            spawnSync('pkill', ['-TERM', '-P', String(child.pid)], {
+              timeout: 3000,
+            });
+          } catch {
+            // ignore if pkill is unavailable
+          }
           child.kill('SIGTERM');
         }
       } catch {
@@ -489,6 +760,17 @@ export class ProcessManager extends EventEmitter {
       }
       this.processes.delete(sessionId);
       session.pid = null;
+    }
+
+    // Also stop any active child SubAgents spawned by this session
+    for (const sub of this.getSubagents(sessionId)) {
+      if (sub.status === 'running' || sub.status === 'starting') {
+        try {
+          this.stopSession(sub.id);
+        } catch {
+          // ignore
+        }
+      }
     }
 
     this.persistAndEmit(session);

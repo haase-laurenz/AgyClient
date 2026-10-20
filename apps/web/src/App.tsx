@@ -1,4 +1,19 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import {
+  TokenActivityAreaChart,
+  ModelDistributionDonutChart,
+  QuotaRadialGauge,
+  TokenCompositionStackedBars,
+  WorkflowDagGraph,
+  ConcurrencySwimlaneGantt,
+  SecurityDefenseDonut,
+} from './Charts';
+import {
+  AgentSessionStreamView,
+  FinalResponseCard,
+  MarkdownRenderer,
+  AgentLogEntry,
+} from './AgentResponseRenderer';
 
 type TabId = 'overview' | 'agents' | 'permissions' | 'usage' | 'workflows';
 
@@ -32,6 +47,8 @@ interface ManagedSession {
   conversationId: string | null;
   parentSessionId: string | null;
   executionRole: string;
+  allowSubagents?: boolean;
+  subagentRole?: string | null;
   model: string;
   effort: string;
   mode: string;
@@ -53,14 +70,6 @@ interface ManagedSession {
   updatedAt: string;
 }
 
-interface AgentLogEntry {
-  id: string;
-  sessionId: string;
-  timestamp: string;
-  stream: 'stdout' | 'stderr' | 'system' | 'agent' | 'tool';
-  text: string;
-}
-
 interface CliConversation {
   conversationId: string;
   title: string;
@@ -77,6 +86,86 @@ interface ModelInfo {
   id: string;
   label: string;
   family: string;
+}
+
+interface SessionTreeNode {
+  session: ManagedSession;
+  children: SessionTreeNode[];
+  depth: number;
+  descendantCount: number;
+  activeDescendantCount: number;
+  aggregatedTokens: number;
+}
+
+function buildSessionHierarchy(sessions: ManagedSession[]): SessionTreeNode[] {
+  const byId = new Map<string, ManagedSession>();
+  const convIdToSessionId = new Map<string, string>();
+
+  for (const s of sessions) {
+    byId.set(s.id, s);
+    if (s.conversationId) {
+      convIdToSessionId.set(s.conversationId, s.id);
+    }
+  }
+
+  const childrenMap = new Map<string, ManagedSession[]>();
+  const roots: ManagedSession[] = [];
+
+  for (const s of sessions) {
+    let resolvedParentId: string | null = null;
+    if (s.parentSessionId) {
+      if (byId.has(s.parentSessionId) && s.parentSessionId !== s.id) {
+        resolvedParentId = s.parentSessionId;
+      } else if (convIdToSessionId.has(s.parentSessionId)) {
+        const mapped = convIdToSessionId.get(s.parentSessionId)!;
+        if (mapped !== s.id) {
+          resolvedParentId = mapped;
+        }
+      }
+    }
+
+    if (resolvedParentId) {
+      const list = childrenMap.get(resolvedParentId) || [];
+      list.push(s);
+      childrenMap.set(resolvedParentId, list);
+    } else {
+      roots.push(s);
+    }
+  }
+
+  const visited = new Set<string>();
+
+  const buildNode = (session: ManagedSession, depth: number): SessionTreeNode => {
+    visited.add(session.id);
+    const rawChildren = (childrenMap.get(session.id) || [])
+      .filter((c) => !visited.has(c.id))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+    const childNodes = rawChildren.map((c) => buildNode(c, depth + 1));
+    const descendantCount = childNodes.reduce((acc, c) => acc + 1 + c.descendantCount, 0);
+    const activeDescendantCount = childNodes.reduce(
+      (acc, c) =>
+        acc +
+        (c.session.status === 'running' || c.session.status === 'starting' ? 1 : 0) +
+        c.activeDescendantCount,
+      0
+    );
+    const aggregatedTokens =
+      session.totalTokens + childNodes.reduce((acc, c) => acc + c.aggregatedTokens, 0);
+
+    return {
+      session,
+      children: childNodes,
+      depth,
+      descendantCount,
+      activeDescendantCount,
+      aggregatedTokens,
+    };
+  };
+
+  return roots
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .map((r) => buildNode(r, 0));
 }
 
 export function App() {
@@ -99,10 +188,24 @@ export function App() {
   const [launchMode, setLaunchMode] = useState('auto');
   const [launchSandbox, setLaunchSandbox] = useState(false);
   const [launchUseWorktree, setLaunchUseWorktree] = useState(false);
+  const [launchAllowSubagents, setLaunchAllowSubagents] = useState(true);
   const [launchPromptsText, setLaunchPromptsText] = useState(
     'Summarize the key modules in this repository in 3 bullet points.'
   );
   const [launching, setLaunching] = useState(false);
+
+  // SubAgent Hierarchy & Spawner state
+  const [collapsedParents, setCollapsedParents] = useState<Record<string, boolean>>({});
+  const [subagentParentId, setSubagentParentId] = useState<string | null>(null);
+  const [subagentTitle, setSubagentTitle] = useState('');
+  const [subagentRole, setSubagentRole] = useState('Researcher');
+  const [subagentModel, setSubagentModel] = useState('');
+  const [subagentUseWorktree, setSubagentUseWorktree] = useState(false);
+  const [subagentAllowNested, setSubagentAllowNested] = useState(false);
+  const [subagentPromptsText, setSubagentPromptsText] = useState(
+    'Analyze the architecture and edge cases of this module and return a concise technical summary.'
+  );
+  const [spawningSubagent, setSpawningSubagent] = useState(false);
 
   // New project form
   const [newProjName, setNewProjName] = useState('');
@@ -308,6 +411,7 @@ export function App() {
           mode: launchMode,
           sandbox: launchSandbox,
           useWorktree: launchUseWorktree,
+          allowSubagents: launchAllowSubagents,
         }),
       });
       if (res.ok) {
@@ -321,6 +425,56 @@ export function App() {
     } finally {
       setLaunching(false);
     }
+  };
+
+  const handleSpawnSubagents = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!subagentParentId) return;
+    const prompts = subagentPromptsText
+      .split('\n---\n')
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (prompts.length === 0) return;
+
+    setSpawningSubagent(true);
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(subagentParentId)}/subagents`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: subagentTitle || undefined,
+          subagentRole,
+          prompts,
+          model: subagentModel || undefined,
+          useWorktree: subagentUseWorktree,
+          allowSubagents: subagentAllowNested,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setCollapsedParents((prev) => ({ ...prev, [subagentParentId]: false }));
+        if (data.subagent?.id) {
+          setSelectedSessionId(data.subagent.id);
+        }
+        setSubagentTitle('');
+        setSubagentParentId(null);
+        await fetchCoreData();
+      }
+    } finally {
+      setSpawningSubagent(false);
+    }
+  };
+
+  const toggleParentCollapse = (parentId: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setCollapsedParents((prev) => ({ ...prev, [parentId]: !prev[parentId] }));
+  };
+
+  const openSubagentSpawner = (parentSession: ManagedSession, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setSubagentParentId(parentSession.id);
+    setSubagentModel(parentSession.model);
+    setSelectedSessionId(parentSession.id);
   };
 
   const handleStopSession = async (id: string) => {
@@ -397,6 +551,153 @@ export function App() {
   const runningCount = sessions.filter(
     (s) => s.status === 'running' || s.status === 'starting'
   ).length;
+  const sessionHierarchy = buildSessionHierarchy(sessions);
+  const subagentSessionsCount = sessions.filter(
+    (s) => Boolean(s.parentSessionId) || s.executionRole === 'subagent'
+  ).length;
+  const rootSessionsCount = sessions.length - subagentSessionsCount;
+
+  // Compute ancestor breadcrumb chain and direct SubAgents for the selected session
+  const selectedSessionAncestors: ManagedSession[] = [];
+  if (selectedSession) {
+    let curr: ManagedSession | undefined = selectedSession;
+    const seen = new Set<string>([selectedSession.id]);
+    while (curr?.parentSessionId) {
+      const pid: string = curr.parentSessionId;
+      const parent: ManagedSession | undefined = sessions.find(
+        (x) => x.id === pid || (x.conversationId && x.conversationId === pid)
+      );
+      if (!parent || seen.has(parent.id)) break;
+      seen.add(parent.id);
+      selectedSessionAncestors.unshift(parent);
+      curr = parent;
+    }
+  }
+
+  const selectedSessionSubagents = selectedSession
+    ? sessions
+        .filter(
+          (s) =>
+            s.parentSessionId === selectedSession.id ||
+            (selectedSession.conversationId && s.parentSessionId === selectedSession.conversationId)
+        )
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    : [];
+
+  const subagentTargetParent = subagentParentId
+    ? sessions.find((s) => s.id === subagentParentId) || null
+    : null;
+
+  const renderSessionTreeNode = (
+    node: SessionTreeNode,
+    isLastSibling: boolean
+  ): React.ReactNode => {
+    const { session: s, children, depth, descendantCount, activeDescendantCount, aggregatedTokens } = node;
+    const isSelected = selectedSessionId === s.id;
+    const isSubagent = depth > 0 || Boolean(s.parentSessionId) || s.executionRole === 'subagent';
+    const isCollapsed = Boolean(collapsedParents[s.id]);
+    const canSpawnSubagent = s.allowSubagents !== false;
+
+    return (
+      <div
+        key={s.id}
+        className={`hierarchy-node ${depth > 0 ? 'hierarchy-node-child' : 'hierarchy-node-root'}`}
+      >
+        <div
+          className={`session-item ${isSelected ? 'selected' : ''} ${
+            isSubagent ? 'session-item-subagent' : 'session-item-root'
+          }`}
+          onClick={() => setSelectedSessionId(s.id)}
+        >
+          <div className="hierarchy-item-header">
+            <div className="hierarchy-title-group">
+              {depth > 0 && (
+                <span className="hierarchy-branch-glyph" title={`Hierarchy Depth L${depth}`}>
+                  {isLastSibling ? '└─' : '├─'}
+                </span>
+              )}
+              {children.length > 0 && (
+                <button
+                  type="button"
+                  className="hierarchy-collapse-btn"
+                  title={isCollapsed ? 'Expand SubAgents' : 'Collapse SubAgents'}
+                  onClick={(e) => toggleParentCollapse(s.id, e)}
+                >
+                  {isCollapsed ? '▸' : '▾'}
+                </button>
+              )}
+              <strong style={{ fontSize: '0.88rem' }}>{s.title}</strong>
+            </div>
+
+            <div className="hierarchy-badges">
+              {isSubagent ? (
+                <span className="badge badge-subagent">
+                  ↳ {s.subagentRole || 'SUBAGENT'} {depth > 0 ? `(L${depth})` : ''}
+                </span>
+              ) : children.length > 0 ? (
+                <span className="badge badge-coordinator">
+                  {descendantCount} SubAgent{descendantCount > 1 ? 's' : ''}
+                  {activeDescendantCount > 0 ? ` • ${activeDescendantCount} active` : ''}
+                </span>
+              ) : null}
+              <span
+                className={`badge ${
+                  s.status === 'running' || s.status === 'starting'
+                    ? 'badge-running'
+                    : s.status === 'completed'
+                    ? 'badge-completed'
+                    : s.status === 'failed'
+                    ? 'badge-failed'
+                    : 'badge-stopped'
+                }`}
+              >
+                {s.status.toUpperCase()}
+              </span>
+            </div>
+          </div>
+
+          <div className="hierarchy-item-meta">
+            <span>
+              Model: <code>{s.model}</code> | PID: {s.pid ?? '—'} | Tokens:{' '}
+              {s.totalTokens.toLocaleString()}
+              {children.length > 0 && aggregatedTokens > s.totalTokens && (
+                <span style={{ color: '#c4b5fd' }}>
+                  {' '}
+                  (Tree: {aggregatedTokens.toLocaleString()})
+                </span>
+              )}{' '}
+              | {s.durationSeconds.toFixed(1)}s
+            </span>
+
+            {canSpawnSubagent && (
+              <button
+                type="button"
+                className="btn-spawn-subagent-inline"
+                title="Spawn a SubAgent under this Agent for more complex tasks"
+                onClick={(e) => openSubagentSpawner(s, e)}
+              >
+                + Spawn SubAgent
+              </button>
+            )}
+          </div>
+
+          {s.branchName && (
+            <div style={{ fontSize: '0.73rem', color: '#60a5fa', marginTop: '2px' }}>
+              Worktree branch: <code>{s.branchName}</code>
+            </div>
+          )}
+        </div>
+
+        {children.length > 0 && !isCollapsed && (
+          <div className="hierarchy-children-container">
+            {children.map((childNode, idx) =>
+              renderSessionTreeNode(childNode, idx === children.length - 1)
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="app-shell">
@@ -506,6 +807,26 @@ export function App() {
 
             <div className="grid-2">
               <div className="card">
+                <h3>
+                  <span>Token Telemetry Trend (Recent Sessions)</span>
+                  <span className="badge badge-official">Live SVG</span>
+                </h3>
+                <TokenActivityAreaChart sessions={usageData?.sessions || []} height={195} />
+              </div>
+
+              <div className="card">
+                <h3>
+                  <span>Model Family Token Share &amp; Concurrency</span>
+                  <span className="badge badge-running">
+                    {Object.keys(usageData?.byModelFamily || {}).length} Families
+                  </span>
+                </h3>
+                <ModelDistributionDonutChart byModelFamily={usageData?.byModelFamily || {}} />
+              </div>
+            </div>
+
+            <div className="grid-2">
+              <div className="card">
                 <h3>Launch Independent agy Agent(s)</h3>
                 <form onSubmit={handleLaunchAgents}>
                   <div className="form-group">
@@ -583,26 +904,36 @@ export function App() {
                     />
                   </div>
 
-                  <div style={{ display: 'flex', gap: '16px', marginBottom: '14px', fontSize: '0.84rem' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '14px', fontSize: '0.84rem' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#c4b5fd', fontWeight: 600 }}>
                       <input
                         type="checkbox"
-                        checked={launchUseWorktree}
-                        onChange={(e) => setLaunchUseWorktree(e.target.checked)}
+                        checked={launchAllowSubagents}
+                        onChange={(e) => setLaunchAllowSubagents(e.target.checked)}
                       />
-                      Isolate in dedicated Git Worktree (<code>.worktrees/</code>)
+                      Allow Agents to spawn &ldquo;SubAgents, for more complex tasks.&rdquo;
                     </label>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <input
-                        type="checkbox"
-                        checked={launchSandbox}
-                        onChange={(e) => setLaunchSandbox(e.target.checked)}
-                      />
-                      Enable CLI Terminal Sandbox (<code>--sandbox</code>)
-                    </label>
+                    <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <input
+                          type="checkbox"
+                          checked={launchUseWorktree}
+                          onChange={(e) => setLaunchUseWorktree(e.target.checked)}
+                        />
+                        Isolate in dedicated Git Worktree (<code>.worktrees/</code>)
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <input
+                          type="checkbox"
+                          checked={launchSandbox}
+                          onChange={(e) => setLaunchSandbox(e.target.checked)}
+                        />
+                        Enable CLI Terminal Sandbox (<code>--sandbox</code>)
+                      </label>
+                    </div>
                   </div>
 
-                  <div style={{ display: 'flex', gap: '10px' }}>
+                  <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
                     <button type="submit" className="btn btn-primary" disabled={launching}>
                       {launching ? 'Starting Process(es)...' : 'Launch Agent Process(es)'}
                     </button>
@@ -702,80 +1033,249 @@ export function App() {
         {activeTab === 'agents' && (
           <div>
             <div className="page-header">
-              <h2>Process & Terminal Manager</h2>
-              <button className="btn btn-primary" onClick={() => setActiveTab('overview')}>
-                + New Agent Process
-              </button>
+              <div>
+                <h2>Agent Hierarchy &amp; Terminal Manager</h2>
+                <span style={{ fontSize: '0.82rem', color: '#94a3b8' }}>
+                  Agents can spawn <strong>SubAgents, for more complex tasks.</strong> Inspect parent-child hierarchies and live streams below.
+                </span>
+              </div>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                {selectedSession && selectedSession.allowSubagents !== false && (
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ borderColor: '#8b5cf6', color: '#c4b5fd' }}
+                    onClick={() => openSubagentSpawner(selectedSession)}
+                  >
+                    + Spawn SubAgent
+                  </button>
+                )}
+                <button className="btn btn-primary" onClick={() => setActiveTab('overview')}>
+                  + New Root Agent
+                </button>
+              </div>
             </div>
+
+            {subagentTargetParent && (
+              <div className="card subagent-spawner-card">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                  <div>
+                    <h3 style={{ margin: 0, color: '#c4b5fd' }}>
+                      ↳ Spawn SubAgent(s), for more complex tasks.
+                    </h3>
+                    <div style={{ fontSize: '0.78rem', color: '#94a3b8', marginTop: '2px' }}>
+                      Parent Agent: <strong>{subagentTargetParent.title}</strong>{' '}
+                      <code>({subagentTargetParent.id.slice(0, 8)})</code>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ padding: '4px 10px', fontSize: '0.76rem' }}
+                    onClick={() => setSubagentParentId(null)}
+                  >
+                    ✕ Close
+                  </button>
+                </div>
+
+                <form onSubmit={handleSpawnSubagents}>
+                  <div className="grid-2" style={{ marginBottom: 0 }}>
+                    <div className="form-group">
+                      <label>SubAgent Role</label>
+                      <select
+                        value={subagentRole}
+                        onChange={(e) => setSubagentRole(e.target.value)}
+                      >
+                        <option value="Researcher">Researcher (Codebase &amp; Docs)</option>
+                        <option value="Architect">Architect (System &amp; API Design)</option>
+                        <option value="Implementer">Implementer (Feature &amp; Refactoring)</option>
+                        <option value="Security & Code Reviewer">Security &amp; Code Reviewer</option>
+                        <option value="Test & Verification">Test &amp; Verification Engineer</option>
+                        <option value="SubAgent">General SubAgent</option>
+                      </select>
+                    </div>
+
+                    <div className="form-group">
+                      <label>SubAgent Title (optional)</label>
+                      <input
+                        type="text"
+                        placeholder={`e.g. [${subagentRole}] Deep Module Audit`}
+                        value={subagentTitle}
+                        onChange={(e) => setSubagentTitle(e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid-2" style={{ marginBottom: 0 }}>
+                    <div className="form-group">
+                      <label>Model (defaults to Parent Agent model)</label>
+                      <select
+                        value={subagentModel || subagentTargetParent.model}
+                        onChange={(e) => setSubagentModel(e.target.value)}
+                      >
+                        {models.map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="form-group" style={{ justifyContent: 'flex-end' }}>
+                      <label>SubAgent Isolation &amp; Nesting</label>
+                      <div style={{ display: 'flex', gap: '14px', fontSize: '0.8rem', paddingTop: '6px' }}>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                          <input
+                            type="checkbox"
+                            checked={subagentUseWorktree}
+                            onChange={(e) => setSubagentUseWorktree(e.target.checked)}
+                          />
+                          Dedicated Git Worktree
+                        </label>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '5px', color: '#c4b5fd' }}>
+                          <input
+                            type="checkbox"
+                            checked={subagentAllowNested}
+                            onChange={(e) => setSubagentAllowNested(e.target.checked)}
+                          />
+                          Allow nested SubAgents
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="form-group">
+                    <label>
+                      Complex Subtask Prompt(s) — Separate multiple prompts with <code>---</code> to spawn parallel SubAgents under <strong>{subagentTargetParent.title}</strong>
+                    </label>
+                    <textarea
+                      rows={3}
+                      value={subagentPromptsText}
+                      onChange={(e) => setSubagentPromptsText(e.target.value)}
+                    />
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    <button type="submit" className="btn btn-primary" disabled={spawningSubagent}>
+                      {spawningSubagent ? 'Spawning SubAgent(s)...' : 'Launch SubAgent(s)'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      onClick={() => {
+                        setSubagentRole('Researcher');
+                        setSubagentPromptsText(
+                          'Inspect packages/process-manager and summarize how SubAgent sessions are tracked.\n---\nInspect packages/permissions and verify destructive command guardrails.'
+                        );
+                      }}
+                    >
+                      Preset: 2 Parallel Research SubAgents
+                    </button>
+                  </div>
+                </form>
+              </div>
+            )}
 
             <div className="split-view">
               <div>
                 <div className="card">
-                  <h3>Managed Agent Processes ({sessions.length})</h3>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                    <div>
+                      <h3 style={{ margin: 0 }}>
+                        Agent Hierarchy ({sessions.length})
+                      </h3>
+                      <div style={{ fontSize: '0.74rem', color: '#94a3b8', marginTop: '2px' }}>
+                        {rootSessionsCount} Root Agent{rootSessionsCount === 1 ? '' : 's'} •{' '}
+                        <span style={{ color: '#c4b5fd' }}>
+                          {subagentSessionsCount} SubAgent{subagentSessionsCount === 1 ? '' : 's'}
+                        </span>
+                      </div>
+                    </div>
+                    {subagentSessionsCount > 0 && (
+                      <div style={{ display: 'flex', gap: '4px' }}>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          style={{ padding: '3px 8px', fontSize: '0.72rem' }}
+                          onClick={() => setCollapsedParents({})}
+                        >
+                          Expand All
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          style={{ padding: '3px 8px', fontSize: '0.72rem' }}
+                          onClick={() => {
+                            const next: Record<string, boolean> = {};
+                            for (const s of sessions) next[s.id] = true;
+                            setCollapsedParents(next);
+                          }}
+                        >
+                          Collapse All
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
                   {sessions.length === 0 && (
                     <div style={{ color: '#94a3b8', fontSize: '0.85rem' }}>
                       No processes launched yet. Use the Dashboard to start one or more parallel agents.
                     </div>
                   )}
-                  {sessions.map((s) => (
-                    <div
-                      key={s.id}
-                      className={`session-item ${selectedSessionId === s.id ? 'selected' : ''}`}
-                      onClick={() => setSelectedSessionId(s.id)}
-                    >
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <strong style={{ fontSize: '0.88rem' }}>{s.title}</strong>
-                        <span
-                          className={`badge ${
-                            s.status === 'running' || s.status === 'starting'
-                              ? 'badge-running'
-                              : s.status === 'completed'
-                              ? 'badge-completed'
-                              : s.status === 'failed'
-                              ? 'badge-failed'
-                              : 'badge-stopped'
-                          }`}
-                        >
-                          {s.status.toUpperCase()}
-                        </span>
-                      </div>
-                      <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '4px' }}>
-                        Model: <code>{s.model}</code> | PID: {s.pid ?? '—'} | Tokens:{' '}
-                        {s.totalTokens.toLocaleString()} | {s.durationSeconds.toFixed(1)}s
-                      </div>
-                      {s.branchName && (
-                        <div style={{ fontSize: '0.73rem', color: '#60a5fa', marginTop: '2px' }}>
-                          Worktree branch: <code>{s.branchName}</code>
-                        </div>
-                      )}
-                    </div>
-                  ))}
+
+                  <div className="hierarchy-tree-root">
+                    {sessionHierarchy.map((node, idx) =>
+                      renderSessionTreeNode(node, idx === sessionHierarchy.length - 1)
+                    )}
+                  </div>
                 </div>
 
                 <div className="card">
-                  <h3>CLI History & Subagents ({cliConversations.length})</h3>
+                  <h3>Parallel Execution Swimlanes (Duration &amp; Load)</h3>
+                  <ConcurrencySwimlaneGantt sessions={sessions} />
+                </div>
+
+                <div className="card">
+                  <h3>CLI History &amp; Native Subagents ({cliConversations.length})</h3>
                   <div style={{ maxHeight: '280px', overflowY: 'auto' }}>
-                    {cliConversations.slice(0, 20).map((c) => (
-                      <div
-                        key={c.conversationId}
-                        style={{
-                          padding: '8px 0',
-                          borderBottom: '1px solid var(--border-color)',
-                          fontSize: '0.8rem',
-                        }}
-                      >
-                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                          <strong>{c.preview || c.title || c.conversationId.slice(0, 8)}</strong>
-                          {c.isLockActive && <span className="badge badge-running">LOCK</span>}
+                    {cliConversations.slice(0, 25).map((c) => {
+                      const depth = Math.max(0, c.nestingDepth || (c.parentConversationId ? 1 : 0));
+                      return (
+                        <div
+                          key={c.conversationId}
+                          style={{
+                            padding: '8px 0',
+                            paddingLeft: `${depth * 18}px`,
+                            borderBottom: '1px solid var(--border-color)',
+                            fontSize: '0.8rem',
+                          }}
+                        >
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px' }}>
+                            <strong>
+                              {depth > 0 && (
+                                <span style={{ color: '#a78bfa', marginRight: '5px' }}>↳</span>
+                              )}
+                              {c.preview || c.title || c.conversationId.slice(0, 8)}
+                            </strong>
+                            <div style={{ display: 'flex', gap: '4px' }}>
+                              {depth > 0 && (
+                                <span className="badge badge-subagent">SUBAGENT L{depth}</span>
+                              )}
+                              {c.isLockActive && <span className="badge badge-running">LOCK</span>}
+                            </div>
+                          </div>
+                          <div style={{ color: '#94a3b8', fontSize: '0.73rem' }}>
+                            ID: <code>{c.conversationId.slice(0, 12)}...</code> | Steps: {c.stepCount}
+                            {c.parentConversationId && (
+                              <span style={{ color: '#c4b5fd' }}>
+                                {' '}
+                                | Parent: <code>{c.parentConversationId.slice(0, 8)}</code>
+                              </span>
+                            )}
+                          </div>
                         </div>
-                        <div style={{ color: '#94a3b8', fontSize: '0.73rem' }}>
-                          ID: <code>{c.conversationId.slice(0, 12)}...</code> | Steps: {c.stepCount}
-                          {c.parentConversationId && (
-                            <span> | Subagent of {c.parentConversationId.slice(0, 8)}</span>
-                          )}
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               </div>
@@ -783,56 +1283,129 @@ export function App() {
               <div className="card">
                 {selectedSession ? (
                   <>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                    {selectedSessionAncestors.length > 0 && (
+                      <div className="hierarchy-breadcrumb-bar">
+                        <span className="hierarchy-breadcrumb-label">Hierarchy Path:</span>
+                        {selectedSessionAncestors.map((anc) => (
+                          <React.Fragment key={anc.id}>
+                            <button
+                              type="button"
+                              className="hierarchy-breadcrumb-link"
+                              onClick={() => setSelectedSessionId(anc.id)}
+                            >
+                              {anc.title}
+                            </button>
+                            <span className="hierarchy-breadcrumb-sep">→</span>
+                          </React.Fragment>
+                        ))}
+                        <span className="hierarchy-breadcrumb-current">
+                          {selectedSession.title}
+                        </span>
+                      </div>
+                    )}
+
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px', gap: '10px', flexWrap: 'wrap' }}>
                       <div>
-                        <h3 style={{ margin: 0 }}>{selectedSession.title}</h3>
-                        <div style={{ fontSize: '0.78rem', color: '#94a3b8' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                          <h3 style={{ margin: 0 }}>{selectedSession.title}</h3>
+                          {(selectedSession.parentSessionId ||
+                            selectedSession.executionRole === 'subagent') && (
+                            <span className="badge badge-subagent">
+                              ↳ {selectedSession.subagentRole || 'SubAgent'}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ fontSize: '0.78rem', color: '#94a3b8', marginTop: '2px' }}>
                           Conversation ID:{' '}
                           <code>{selectedSession.conversationId || 'assigning...'}</code> | CWD:{' '}
                           <code>{selectedSession.worktreePath || selectedSession.workspacePath}</code>
                         </div>
                       </div>
-                      {(selectedSession.status === 'running' ||
-                        selectedSession.status === 'starting') && (
-                        <button
-                          className="btn btn-danger"
-                          onClick={() => handleStopSession(selectedSession.id)}
-                        >
-                          Stop Process (PID {selectedSession.pid})
-                        </button>
-                      )}
+                      <div style={{ display: 'flex', gap: '8px' }}>
+                        {selectedSession.allowSubagents !== false && (
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            style={{ borderColor: '#8b5cf6', color: '#c4b5fd', padding: '6px 11px', fontSize: '0.78rem' }}
+                            onClick={() => openSubagentSpawner(selectedSession)}
+                          >
+                            + Spawn SubAgent
+                          </button>
+                        )}
+                        {(selectedSession.status === 'running' ||
+                          selectedSession.status === 'starting') && (
+                          <button
+                            className="btn btn-danger"
+                            onClick={() => handleStopSession(selectedSession.id)}
+                          >
+                            Stop Process (PID {selectedSession.pid})
+                          </button>
+                        )}
+                      </div>
                     </div>
 
-                    <div className="terminal-box">
-                      {sessionLogs.length === 0 ? (
-                        <div className="log-system">Waiting for stream-json events...</div>
-                      ) : (
-                        sessionLogs.map((l) => (
-                          <div key={l.id} className={`log-line log-${l.stream}`}>
-                            <span style={{ color: '#64748b' }}>
-                              [{new Date(l.timestamp).toLocaleTimeString()}] [{l.stream.toUpperCase()}]{' '}
-                            </span>
-                            {l.text}
-                          </div>
-                        ))
-                      )}
-                    </div>
-
-                    {selectedSession.lastResponse && (
-                      <div
-                        style={{
-                          marginTop: '14px',
-                          padding: '12px',
-                          borderRadius: '8px',
-                          background: 'var(--bg-secondary)',
-                          border: '1px solid var(--border-color)',
-                        }}
-                      >
-                        <div className="kpi-label">Latest Final Agent Response</div>
-                        <div style={{ whiteSpace: 'pre-wrap', fontSize: '0.88rem', marginTop: '6px' }}>
-                          {selectedSession.lastResponse}
+                    {selectedSessionSubagents.length > 0 && (
+                      <div className="subagents-overview-box">
+                        <div className="subagents-overview-header">
+                          <span className="kpi-label" style={{ color: '#c4b5fd' }}>
+                            ↳ Spawned SubAgents ({selectedSessionSubagents.length})
+                          </span>
+                          <span style={{ fontSize: '0.74rem', color: '#94a3b8' }}>
+                            Click any SubAgent to inspect its execution stream
+                          </span>
+                        </div>
+                        <div className="subagents-overview-grid">
+                          {selectedSessionSubagents.map((sub) => (
+                            <div
+                              key={sub.id}
+                              className="subagent-mini-card"
+                              onClick={() => setSelectedSessionId(sub.id)}
+                            >
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px' }}>
+                                <strong style={{ fontSize: '0.8rem', color: '#f1f5f9' }}>
+                                  {sub.title}
+                                </strong>
+                                <span
+                                  className={`badge ${
+                                    sub.status === 'running' || sub.status === 'starting'
+                                      ? 'badge-running'
+                                      : sub.status === 'completed'
+                                      ? 'badge-completed'
+                                      : sub.status === 'failed'
+                                      ? 'badge-failed'
+                                      : 'badge-stopped'
+                                  }`}
+                                >
+                                  {sub.status.toUpperCase()}
+                                </span>
+                              </div>
+                              <div style={{ fontSize: '0.72rem', color: '#94a3b8', marginTop: '4px' }}>
+                                Role: <code style={{ color: '#c4b5fd' }}>{sub.subagentRole || 'SubAgent'}</code> •{' '}
+                                {sub.totalTokens.toLocaleString()} tok • {sub.durationSeconds.toFixed(1)}s
+                              </div>
+                            </div>
+                          ))}
                         </div>
                       </div>
+                    )}
+
+                    <AgentSessionStreamView
+                      logs={sessionLogs}
+                      sessionPrompt={selectedSession.prompt}
+                      lastResponse={selectedSession.lastResponse}
+                      sessionStatus={selectedSession.status}
+                      model={selectedSession.model}
+                    />
+
+                    {selectedSession.lastResponse && (
+                      <FinalResponseCard
+                        content={selectedSession.lastResponse}
+                        model={selectedSession.model}
+                        durationSeconds={selectedSession.durationSeconds}
+                        totalTokens={selectedSession.totalTokens}
+                        turnCount={selectedSession.turnCount}
+                        status={selectedSession.status}
+                      />
                     )}
 
                     <form
@@ -880,36 +1453,48 @@ export function App() {
               </span>
             </div>
 
-            <div className="card">
-              <h3>Quick Security Presets</h3>
-              <div className="grid-4" style={{ marginBottom: 0 }}>
-                {(permData?.presets || []).map((preset) => (
-                  <div
-                    key={preset.id}
-                    style={{
-                      padding: '12px',
-                      borderRadius: '8px',
-                      background: 'var(--bg-secondary)',
-                      border: '1px solid var(--border-color)',
-                    }}
-                  >
-                    <strong style={{ fontSize: '0.88rem' }}>{preset.name}</strong>
-                    <p style={{ fontSize: '0.76rem', color: '#94a3b8', margin: '6px 0 10px' }}>
-                      {preset.description}
-                    </p>
-                    <button
-                      className="btn btn-secondary"
-                      style={{ fontSize: '0.76rem', padding: '5px 10px' }}
-                      onClick={() => {
-                        setAllowText(preset.permissions.allow.join('\n'));
-                        setAskText(preset.permissions.ask.join('\n'));
-                        setDenyText(preset.permissions.deny.join('\n'));
+            <div className="grid-2">
+              <div className="card">
+                <h3>Security Rule Distribution &amp; Defense Posture</h3>
+                <SecurityDefenseDonut
+                  allowCount={permData?.settings?.permissions?.allow?.length || 0}
+                  askCount={permData?.settings?.permissions?.ask?.length || 0}
+                  denyCount={permData?.settings?.permissions?.deny?.length || 0}
+                  protectedProjectsCount={projects.filter((p) => p.deleteProtected).length}
+                />
+              </div>
+
+              <div className="card">
+                <h3>Quick Security Presets</h3>
+                <div className="grid-2" style={{ marginBottom: 0 }}>
+                  {(permData?.presets || []).map((preset) => (
+                    <div
+                      key={preset.id}
+                      style={{
+                        padding: '12px',
+                        borderRadius: '8px',
+                        background: 'var(--bg-secondary)',
+                        border: '1px solid var(--border-color)',
                       }}
                     >
-                      Load Preset into Editor
-                    </button>
-                  </div>
-                ))}
+                      <strong style={{ fontSize: '0.88rem' }}>{preset.name}</strong>
+                      <p style={{ fontSize: '0.76rem', color: '#94a3b8', margin: '6px 0 10px' }}>
+                        {preset.description}
+                      </p>
+                      <button
+                        className="btn btn-secondary"
+                        style={{ fontSize: '0.76rem', padding: '5px 10px' }}
+                        onClick={() => {
+                          setAllowText(preset.permissions.allow.join('\n'));
+                          setAskText(preset.permissions.ask.join('\n'));
+                          setDenyText(preset.permissions.deny.join('\n'));
+                        }}
+                      >
+                        Load Preset into Editor
+                      </button>
+                    </div>
+                  ))}
+                </div>
               </div>
             </div>
 
@@ -1116,6 +1701,30 @@ export function App() {
               </div>
             </div>
 
+            <div className="gauges-grid">
+              {(usageData?.quotas || []).map((q: any) => (
+                <QuotaRadialGauge key={q.family} quota={q} />
+              ))}
+            </div>
+
+            <div className="grid-2">
+              <div className="card">
+                <h3>
+                  <span>Token Consumption Curve (Input vs Total)</span>
+                  <span className="badge badge-official">Interactive</span>
+                </h3>
+                <TokenActivityAreaChart sessions={usageData?.sessions || []} height={210} />
+              </div>
+
+              <div className="card">
+                <h3>
+                  <span>Token Composition per Session (Input / Cache / Output)</span>
+                  <span className="badge badge-official">Breakdown</span>
+                </h3>
+                <TokenCompositionStackedBars sessions={usageData?.sessions || []} />
+              </div>
+            </div>
+
             <div className="grid-2">
               {(usageData?.quotas || []).map((q: any) => (
                 <div key={q.family} className="card">
@@ -1243,9 +1852,10 @@ export function App() {
                     <p style={{ fontSize: '0.78rem', color: '#94a3b8', margin: '6px 0' }}>
                       {tpl.description}
                     </p>
-                    <div style={{ fontSize: '0.74rem', color: '#93c5fd' }}>
+                    <div style={{ fontSize: '0.74rem', color: '#93c5fd', marginBottom: '6px' }}>
                       Tasks: {tpl.tasks.map((t: any) => `${t.name} (${t.strategy})`).join(' → ')}
                     </div>
+                    <WorkflowDagGraph tasks={tpl.tasks} title="Pipeline Topology (DAG)" />
                   </div>
                 ))}
 
@@ -1275,6 +1885,7 @@ export function App() {
                         {wf.status.toUpperCase()}
                       </span>
                     </div>
+                    <WorkflowDagGraph tasks={wf.tasks} title="Live Execution Graph" />
                     <div style={{ marginTop: '8px', fontSize: '0.8rem' }}>
                       {wf.tasks.map((t: any) => (
                         <div

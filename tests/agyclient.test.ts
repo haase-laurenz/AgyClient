@@ -13,6 +13,7 @@ import { ProcessManager } from '../packages/process-manager/src/index.js';
 import { GitWorktreeManager } from '../packages/git-manager/src/index.js';
 import { WorkflowOrchestrator } from '../packages/orchestrator/src/index.js';
 import { createAgyServer } from '../apps/server/src/app.js';
+import { parseCliArgs, runCli } from '../apps/server/src/cli.js';
 
 describe('AgyClient Comprehensive Test Suite (P0 - P7)', () => {
   let tmpDir: string;
@@ -423,6 +424,214 @@ describe('AgyClient Comprehensive Test Suite (P0 - P7)', () => {
       expect(sessionsData.sessions[0].lastResponse).toBe('Survived restart');
 
       await instance2.close();
+    });
+  });
+
+  describe('P8: Cross-Platform CLI Interface (agyclient / agy-client) & Linux Support', () => {
+    it('generates OS-appropriate delete-lock commands for Linux, macOS, and Windows', () => {
+      const linuxCmds = PermissionsManager.getDeleteLockCommands('/home/dev/project', 'dev', 'linux');
+      expect(linuxCmds.platform).toBe('linux');
+      expect(linuxCmds.enableCommand).toContain('chattr +a');
+      expect(linuxCmds.checkCommand).toContain('lsattr -d');
+
+      const macCmds = PermissionsManager.getDeleteLockCommands('/Users/dev/project', 'dev', 'darwin');
+      expect(macCmds.platform).toBe('darwin');
+      expect(macCmds.enableCommand).toContain('deny delete,delete_child');
+
+      const winCmds = PermissionsManager.getDeleteLockCommands('C:\\project', 'dev', 'win32');
+      expect(winCmds.platform).toBe('win32');
+      expect(winCmds.enableCommand).toContain('icacls');
+    });
+
+    it('parses CLI flags and executes doctor, permissions, status, and run subcommands', async () => {
+      const parsed = parseCliArgs(['run', 'Inspect repo', '-m', 'gemini-4-argon-high', '--worktree']);
+      expect(parsed.command).toBe('run');
+      expect(parsed.positionals).toEqual(['Inspect repo']);
+      expect(parsed.flags.model).toBe('gemini-4-argon-high');
+      expect(parsed.flags.worktree).toBe(true);
+
+      const settingsPath = path.join(tmpDir, 'settings.json');
+      const backupDir = path.join(tmpDir, 'backups');
+      const dbPath = path.join(tmpDir, 'cli.db');
+      const mockAgyScript = path.join(tmpDir, 'mock-cli-agy.mjs');
+
+      fs.writeFileSync(
+        mockAgyScript,
+        `
+        console.log(JSON.stringify({
+          event: 'init',
+          conversation_id: 'conv-cli-1',
+          init: { cwd: process.cwd(), tools: [], permission_mode: 'auto' }
+        }));
+        console.log(JSON.stringify({
+          event: 'result',
+          result: {
+            conversation_id: 'conv-cli-1',
+            status: 'SUCCESS',
+            response: 'CLI run finished',
+            duration_seconds: 0.1,
+            num_turns: 1,
+            usage: { input_tokens: 50, output_tokens: 10, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 60 }
+          }
+        }));
+        process.exit(0);
+        `,
+        'utf-8'
+      );
+
+      const logs: string[] = [];
+      const env = {
+        cwd: tmpDir,
+        agyBin: mockAgyScript,
+        appDataDir: tmpDir,
+        settingsPath,
+        backupDir,
+        dbPath,
+        stdout: (msg: string) => logs.push(msg),
+        stderr: (msg: string) => logs.push(msg),
+      };
+
+      // 1. Apply permission preset via CLI
+      const presetCode = await runCli(['permissions', 'preset', 'autonomous-safe'], env);
+      expect(presetCode).toBe(0);
+
+      // 2. Evaluate a Linux deletion command via CLI
+      logs.length = 0;
+      const evalCode = await runCli(['permissions', 'eval', 'rm -rf /tmp/data', '--json'], env);
+      expect(evalCode).toBe(0);
+      const evalJson = JSON.parse(logs.join('\n'));
+      expect(evalJson.decision).toBe('deny');
+
+      // 3. Run an agent turn via CLI and verify persistence in status
+      logs.length = 0;
+      const runCode = await runCli(['run', 'Test CLI agent', '--json'], env);
+      expect(runCode).toBe(0);
+      const runSession = JSON.parse(logs.join('\n'));
+      expect(runSession.status).toBe('completed');
+      expect(runSession.totalTokens).toBe(60);
+
+      // 4. Query status via CLI
+      logs.length = 0;
+      const statusCode = await runCli(['status', '--json'], env);
+      expect(statusCode).toBe(0);
+      const statusJson = JSON.parse(logs.join('\n'));
+      expect(statusJson.sessions.total).toBe(1);
+      expect(statusJson.sessions.completed).toBe(1);
+    });
+  });
+
+  describe('P9: SubAgent Spawning & Hierarchy Management', () => {
+    it('extracts <subagent> directives, spawns child SubAgents via API & ProcessManager, and tracks native invoke_subagent hierarchy', async () => {
+      const directives = ProcessManager.extractSubagentDirectives(
+        `Let's delegate:\n<subagent title="Audit Auth" role="Security Reviewer">Check token validation</subagent>`
+      );
+      expect(directives).toHaveLength(1);
+      expect(directives[0].title).toBe('Audit Auth');
+      expect(directives[0].role).toBe('Security Reviewer');
+      expect(directives[0].prompt).toBe('Check token validation');
+
+      const mockAgyScript = path.join(tmpDir, 'mock-subagent-agy.mjs');
+      fs.writeFileSync(
+        mockAgyScript,
+        `
+        const args = process.argv.slice(2);
+        const promptIdx = args.indexOf('--print');
+        const prompt = promptIdx !== -1 ? args[promptIdx + 1] : 'default';
+        const convId = 'conv-' + Math.random().toString(36).slice(2, 10);
+        console.log(JSON.stringify({
+          event: 'init',
+          conversation_id: convId,
+          init: { cwd: process.cwd(), tools: ['invoke_subagent'], permission_mode: 'auto' }
+        }));
+        if (prompt.includes('USE_NATIVE_SUBAGENT')) {
+          console.log(JSON.stringify({
+            event: 'step_update',
+            step_update: {
+              conversation_id: convId,
+              step_index: 2,
+              state: 'DONE',
+              step_type: 'tool_call',
+              tool_name: 'invoke_subagent',
+              tool_args: { TypeName: 'research', Role: 'Codebase Researcher', Prompt: 'Inspect modules' },
+              duration_seconds: 0.4
+            }
+          }));
+        }
+        console.log(JSON.stringify({
+          event: 'result',
+          result: {
+            conversation_id: convId,
+            status: 'SUCCESS',
+            response: 'Completed: ' + prompt,
+            duration_seconds: 0.2,
+            num_turns: 1,
+            usage: { input_tokens: 80, output_tokens: 20, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 100 }
+          }
+        }));
+        process.exit(0);
+        `,
+        'utf-8'
+      );
+
+      const dbPath = path.join(tmpDir, 'subagents.db');
+      const settingsPath = path.join(tmpDir, 'settings.json');
+      const backupDir = path.join(tmpDir, 'backups');
+
+      const instance = createAgyServer({
+        dbPath,
+        agyBin: mockAgyScript,
+        settingsPath,
+        backupDir,
+        defaultWorkspacePath: tmpDir,
+      });
+
+      await new Promise<void>((resolve) => instance.server.listen(0, '127.0.0.1', () => resolve()));
+      const addr = instance.server.address() as { port: number };
+      const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+      // 1. Launch a root parent agent that also invokes a native subagent
+      const parentDone = new Promise<void>((resolve) => {
+        instance.processManager.once('session:completed', () => resolve());
+      });
+
+      const launchRes = await fetch(`${baseUrl}/api/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: 'Root Coordinator Agent',
+          workspacePath: tmpDir,
+          prompt: 'USE_NATIVE_SUBAGENT: Coordinate complex task',
+          allowSubagents: true,
+        }),
+      });
+      expect(launchRes.status).toBe(201);
+      const launchData = await launchRes.json();
+      const parentId = launchData.session.id;
+
+      await parentDone;
+
+      // 2. Spawn 2 parallel child SubAgents under the parent via POST /api/sessions/:id/subagents
+      const subRes = await fetch(`${baseUrl}/api/sessions/${encodeURIComponent(parentId)}/subagents`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subagentRole: 'Architect',
+          prompts: ['Design database schema', 'Design REST endpoints'],
+        }),
+      });
+      expect(subRes.status).toBe(201);
+      const subData = await subRes.json();
+      expect(subData.subagents).toHaveLength(2);
+      expect(subData.subagents[0].parentSessionId).toBe(parentId);
+      expect(subData.subagents[0].executionRole).toBe('subagent');
+      expect(subData.subagents[0].subagentRole).toBe('Architect');
+
+      // 3. Verify GET /api/sessions/:id/subagents returns both native + spawned SubAgents (total 3)
+      const listSubRes = await fetch(`${baseUrl}/api/sessions/${encodeURIComponent(parentId)}/subagents`);
+      const listSubData = await listSubRes.json();
+      expect(listSubData.subagents).toHaveLength(3);
+
+      await instance.close();
     });
   });
 });
