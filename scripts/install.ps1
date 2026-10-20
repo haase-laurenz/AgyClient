@@ -9,7 +9,7 @@ Set-Location $RepoRoot
 
 if ($Uninstall) {
     Write-Host "Unlinking agyclient global CLI..." -ForegroundColor Yellow
-    npm unlink -g agy-client
+    & npm.cmd unlink -g agy-client
     Write-Host "Removed global agyclient link." -ForegroundColor Green
     exit 0
 }
@@ -19,16 +19,19 @@ Write-Host "  AgyClient CLI Installer (Windows)" -ForegroundColor Cyan
 Write-Host "========================================================" -ForegroundColor Cyan
 
 Write-Host "[1/4] Installing npm dependencies..." -ForegroundColor Yellow
-npm install
+& npm.cmd install
+if ($LASTEXITCODE -ne 0) { throw "npm install failed with exit code $LASTEXITCODE" }
 
 Write-Host "[2/4] Building AgyClient packages, CLI, and web dashboard..." -ForegroundColor Yellow
-npm run build
+& npm.cmd run build
+if ($LASTEXITCODE -ne 0) { throw "npm run build failed with exit code $LASTEXITCODE" }
 
 Write-Host "[3/4] Linking 'agyclient' and 'agy-client' globally via npm link..." -ForegroundColor Yellow
-npm link
+& npm.cmd link
+if ($LASTEXITCODE -ne 0) { throw "npm link failed with exit code $LASTEXITCODE" }
 
 Write-Host "[4/4] Verifying Windows PATH configuration..." -ForegroundColor Yellow
-$NpmGlobalBin = (npm prefix -g).Trim()
+$NpmGlobalBin = (& npm.cmd prefix -g).Trim()
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($UserPath -notlike "*$NpmGlobalBin*") {
     [Environment]::SetEnvironmentVariable("Path", "$UserPath;$NpmGlobalBin", "User")

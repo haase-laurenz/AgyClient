@@ -15,12 +15,14 @@ Write-Host "========================================================" -Foregroun
 
 if (-not (Test-Path "node_modules")) {
     Write-Host "[1/3] Installing npm dependencies..." -ForegroundColor Yellow
-    npm install
+    & npm.cmd install
+    if ($LASTEXITCODE -ne 0) { throw "npm install failed with exit code $LASTEXITCODE" }
 }
 
 if ($Rebuild -or -not (Test-Path "apps/server/dist/index.js") -or -not (Test-Path "apps/web/dist/index.html")) {
     Write-Host "[2/3] Building AgyClient packages, backend, and web dashboard..." -ForegroundColor Yellow
-    npm run build
+    & npm.cmd run build
+    if ($LASTEXITCODE -ne 0) { throw "npm run build failed with exit code $LASTEXITCODE" }
 }
 
 $env:AGYCLIENT_HOST = $HostAddress
